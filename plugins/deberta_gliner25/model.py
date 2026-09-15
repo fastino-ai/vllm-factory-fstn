@@ -1,7 +1,7 @@
-"""GLiNER2 vLLM Model — Schema-based multi-task extraction.
+"""GLiNER 2.5 vLLM model: DeBERTa v2 encoder + boundary pooler.
 
-Uses custom vLLM-optimized DebertaV2EncoderModel as backbone (Flash DeBERTa Triton kernel
-+ vLLM parallel layers) with GLiNER2Pooler for the head (SpanRep + CountLSTM + classifier + count_pred).
+Pooler is imported inside ``__init__`` so ``register()`` stays safe without
+the ``gliner2`` extra.
 """
 
 from __future__ import annotations
@@ -27,19 +27,26 @@ from vllm_factory.lora.routing import (
 )
 from vllm_factory.packing import pad_batch, sequence_lengths
 from vllm_factory.pooling.lora_heads import (
-    SPAN_HEAD_NAMES,
+    BOUNDARY_HEAD_NAMES,
     convert_heads_to_replicated,
     head_weights_mapper,
+    present_head_names,
 )
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
 
-from .config import GLiNER2Config
+from .config import GLiNER25Config
 
 logger = logging.getLogger(__name__)
 
-# Load the custom DeBERTa v2 encoder with Flash DeBERTa Triton kernel
 _ENCODER_PATH = (
     Path(__file__).resolve().parents[2] / "models" / "deberta_v2" / "deberta_v2_encoder.py"
+)
+
+_HEAD_PREFIXES = (
+    "boundary_head.",
+    "record_decoder.",
+    "relation_scorer.",
+    "classifier.",
 )
 
 
@@ -57,19 +64,14 @@ _ENCODER_PACKED_MODULES_MAPPING: dict[str, list[str]] = _encoder_mod.PACKED_MODU
 _ENCODER_EMBEDDING_MODULES: dict[str, str] = _encoder_mod.EMBEDDING_MODULES
 
 
-class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
-    """GLiNER2 model for vLLM: custom vLLM-optimized encoder backbone + GLiNER2 pooler head.
+class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
+    """Boundary GLiNER 2.5: Flash DeBERTa encoder + gliner2 heads.
 
-    Declares `SupportsLoRA` and forwards the DeBERTa v2/v3 backbone's LoRA
-    metadata under the ``encoder.`` prefix — the plugin wraps the encoder as
-    ``self.encoder``, so every adapter target resolved by vLLM's LoRA manager
-    walks through that attribute. PEFT adapters produced against the GLiNER2
-    DeBERTa backbone (``target_modules=["query_proj", "key_proj",
-    "value_proj"]`` by convention) are registered directly by layer name; no
-    packing rewrite is needed. Task heads (``span_rep`` / ``classifier`` /
-    ``count_pred`` / ``count_embed``) are converted to ``ReplicatedLinear`` so
-    a multi-task-head adapter is loadable, and ``hf_to_vllm_mapper`` rewrites
-    PEFT's top-level head prefixes onto ``_business_pooler.``.
+    Encoder LoRA metadata is re-exported under ``encoder.``. Task heads
+    (``classifier`` / ``boundary_head`` / ``record_decoder`` /
+    ``relation_scorer`` when present) are converted to ``ReplicatedLinear``
+    so a multi-task-head adapter is loadable, and ``hf_to_vllm_mapper``
+    rewrites PEFT's top-level head prefixes onto ``_business_pooler.``.
     """
 
     is_pooling_model = True
@@ -84,11 +86,10 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        cfg: GLiNER2Config = vllm_config.model_config.hf_config
+        cfg: GLiNER25Config = vllm_config.model_config.hf_config
         self.config = cfg
         self.vllm_config = vllm_config
 
-        # Build DeBERTa v2/v3 config for the custom encoder
         encoder_cfg = DebertaV2Config(
             vocab_size=cfg.vocab_size,
             hidden_size=cfg.encoder_hidden_size,
@@ -110,30 +111,26 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
             position_biased_input=cfg.encoder_position_biased_input,
             pad_token_id=cfg.encoder_pad_token_id,
         )
-
-        # 1. Backbone — custom DeBERTa v2 with Flash DeBERTa Triton kernel
         self.encoder = DebertaV2EncoderModel(config=encoder_cfg)
         self._encoder_pad_id = int(cfg.encoder_pad_token_id or 0)
 
-        # 2. GLiNER2 head (span_rep + count_embed + classifier + count_pred)
-        # Imported here so register() stays import-safe without the gliner2 extra.
-        from poolers.gliner2 import GLiNER2Pooler
+        from poolers.gliner25 import GLiNER25BoundaryPooler
 
-        self._business_pooler = GLiNER2Pooler(
+        self._business_pooler = GLiNER25BoundaryPooler(
             hidden_size=cfg.encoder_hidden_size,
-            max_width=cfg.max_width,
-            counting_layer=cfg.counting_layer,
+            boundary_head=cfg.boundary_head,
+            tokenizer_name=vllm_config.model_config.model,
+            max_model_len=getattr(vllm_config.model_config, "max_model_len", None),
         )
-        convert_heads_to_replicated(self._business_pooler, SPAN_HEAD_NAMES)
-        self.hf_to_vllm_mapper = head_weights_mapper(SPAN_HEAD_NAMES)
+        head_names = present_head_names(self._business_pooler, BOUNDARY_HEAD_NAMES)
+        convert_heads_to_replicated(self._business_pooler, head_names)
+        self.hf_to_vllm_mapper = head_weights_mapper(head_names)
         self.pooler = VllmPoolerAdapter(self._business_pooler, requires_token_ids=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Required by vLLM's pooling runner for embedding lookup."""
         return self.encoder.embeddings.word_embeddings(input_ids)
 
     def sample(self, logits: torch.Tensor, sampling_metadata):
-        """Override sampling for pooling models — return empty outputs."""
         try:
             from vllm.sequence import SamplerOutput
 
@@ -193,32 +190,14 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
         return out
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load weights from GLiNER2 checkpoint.
-
-        GLiNER2 state_dict prefixes:
-            encoder.*        → self.encoder (custom DebertaV2EncoderModel)
-            span_rep.*       → self.pooler.span_rep
-            classifier.*     → self.pooler.classifier
-            count_pred.*     → self.pooler.count_pred
-            count_embed.*    → self.pooler.count_embed
-
-        The custom encoder's load_weights() expects HF DeBERTa keys with
-        'deberta.' prefix and handles the .attention.self. → .attention.self_attn.
-        mapping internally.
-        """
-        encoder_prefix = "encoder."
-
+        """Load encoder.* via the DeBERTa encoder; remaining prefixes into the pooler."""
         pooler_keys = set(self._business_pooler.state_dict().keys())
-
         backbone_weights = []
         pooler_loaded = {}
 
         for hf_name, tensor in weights:
-            if hf_name.startswith(encoder_prefix):
-                # Strip "encoder." and re-add "deberta." prefix for custom encoder
-                hf_key = hf_name[len(encoder_prefix) :]
-
-                # Handle vocab size mismatch (might have extra special tokens)
+            if hf_name.startswith("encoder."):
+                hf_key = hf_name[len("encoder.") :]
                 if "word_embeddings.weight" in hf_key:
                     vocab_size = getattr(self.config, "vocab_size", None)
                     if vocab_size and tensor.shape[0] != vocab_size:
@@ -227,61 +206,33 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
                         else:
                             extra = vocab_size - tensor.shape[0]
                             tensor = torch.cat(
-                                [
-                                    tensor,
-                                    torch.randn(extra, tensor.shape[1]) * 0.02,
-                                ],
+                                [tensor, torch.randn(extra, tensor.shape[1]) * 0.02],
                                 dim=0,
                             )
-
                 backbone_weights.append(("deberta." + hf_key, tensor))
-            else:
-                # Pooler weights: span_rep.*, classifier.*, count_pred.*, count_embed.*
+                continue
+            if any(hf_name.startswith(prefix) for prefix in _HEAD_PREFIXES):
                 if hf_name in pooler_keys:
                     pooler_loaded[hf_name] = tensor
 
-        # Load backbone via custom encoder's load_weights
         self.encoder.load_weights(backbone_weights)
-        logger.info("[GLiNER2] Loaded encoder: %s weight tensors", len(backbone_weights))
+        logger.info("[GLiNER25] Loaded encoder: %s tensors", len(backbone_weights))
 
-        # Load pooler (use business pooler directly to avoid _inner. prefix mismatch).
-        #
-        # We keep ``strict=False`` because backbone / ``deberta.*`` keys are
-        # loaded separately above — they'd otherwise show up as "unexpected"
-        # here. But we still guard against the failure mode that masked the
-        # count_lstm_v2 / count_lstm_moe incompatibility for months: with
-        # the wrong ``GLiNER2Pooler.count_embed`` variant, every
-        # ``count_embed.*`` key beyond the shared pos_embedding + GRU is
-        # silently dropped and inference proceeds with a mostly random-init
-        # count_embed. Compute expected / actual key sets from the pooler
-        # + filtered weights and raise if anything was dropped.
-        if pooler_loaded:
-            missing = pooler_keys - pooler_loaded.keys()
-            unexpected = pooler_loaded.keys() - pooler_keys
-            if missing or unexpected:
-                raise RuntimeError(
-                    "GLiNER2 pooler weight-load mismatch — "
-                    f"counting_layer={getattr(self.config, 'counting_layer', '?')!r} "
-                    f"missing={sorted(missing)!r} unexpected={sorted(unexpected)!r}. "
-                    "This indicates a pooler variant / checkpoint mismatch: "
-                    "the pooler's count_embed class does not match the "
-                    "checkpoint's counting_layer."
-                )
-            self._business_pooler.load_state_dict(pooler_loaded, strict=False)
-            device = next(self.encoder.parameters()).device
-            dtype = self.vllm_config.model_config.dtype
-            self._business_pooler.to(device=device, dtype=dtype)
-            logger.info(
-                "[GLiNER2] Loaded pooler: %s/%s keys (counting_layer=%s)",
-                len(pooler_loaded),
-                len(pooler_keys),
-                getattr(self.config, "counting_layer", "?"),
-            )
-        else:
+        if not pooler_loaded:
             raise RuntimeError(
-                "GLiNER2 pooler weights were empty after load_weights. "
-                "A boundary checkpoint prepared as a span model produces a "
-                "random-init head; refusing to serve it."
+                "GLiNER25 pooler weights were empty after load_weights. "
+                "Refusing to serve a random-init boundary head."
             )
-
-        return set(name for name, _ in self.named_parameters())
+        missing = pooler_keys - pooler_loaded.keys()
+        unexpected = pooler_loaded.keys() - pooler_keys
+        if missing or unexpected:
+            raise RuntimeError(
+                "GLiNER25 pooler weight-load mismatch — "
+                f"missing={sorted(missing)!r} unexpected={sorted(unexpected)!r}."
+            )
+        self._business_pooler.load_state_dict(pooler_loaded, strict=False)
+        device = next(self.encoder.parameters()).device
+        dtype = self.vllm_config.model_config.dtype
+        self._business_pooler.to(device=device, dtype=dtype)
+        logger.info("[GLiNER25] Loaded pooler: %s/%s keys", len(pooler_loaded), len(pooler_keys))
+        return {name for name, _ in self.named_parameters()}
