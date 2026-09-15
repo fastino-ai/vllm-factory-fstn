@@ -20,11 +20,41 @@ from vllm.model_executor.layers.pooler.common import PoolingParamsUpdate
 from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
 from vllm.v1.pool.metadata import PoolingMetadata
 
-from vllm_factory.pooling.protocol import FactoryPooler, PassthroughPooler, PoolerContext
+from vllm_factory.lora.routing import batch_routing, uniform_scope
+from vllm_factory.pooling.protocol import (
+    NO_ADAPTER,
+    FactoryPooler,
+    PassthroughPooler,
+    PoolerContext,
+    null_lora_scope,
+)
 
 logger = logging.getLogger(__name__)
 
 PoolerOutput = list[torch.Tensor | None]
+
+
+def _lora_binding(count: int) -> tuple[tuple[int, ...], Any]:
+    """Build the per-sequence adapter slots and scope factory for this batch.
+
+    The model's forward pass publishes the routing it resolved for the same
+    batch, so the pooler reuses it rather than re-reading vLLM's step mapping.
+
+    Args:
+        count: Number of scheduled sequences.
+
+    Returns:
+        A ``(slots, scope)`` pair; ``scope`` takes a sequence index and returns
+        a context manager binding head projections to that sequence's adapter.
+    """
+    routing = batch_routing()
+    if routing is None or routing.wrapper is None or len(routing.slots) != count:
+        return (NO_ADAPTER,) * count, null_lora_scope
+
+    def scope(seq_index: int):
+        return uniform_scope(routing.wrapper, routing.slots[seq_index])
+
+    return routing.slots, scope
 
 
 def _translate_metadata(pm: PoolingMetadata) -> PoolerContext:
@@ -41,11 +71,14 @@ def _translate_metadata(pm: PoolingMetadata) -> PoolerContext:
         ek = getattr(pp, "extra_kwargs", None) or {}
         extra_kwargs.append(ek)
         tasks.append(pp.task or "plugin")
+    lora_slots, lora_scope = _lora_binding(len(seq_lengths))
     return PoolerContext(
         seq_lengths=seq_lengths,
         extra_kwargs=extra_kwargs,
         tasks=tasks,
         prompt_token_ids=prompt_token_ids,
+        lora_slots=lora_slots,
+        lora_scope=lora_scope,
     )
 
 

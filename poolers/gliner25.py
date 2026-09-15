@@ -175,15 +175,18 @@ class GLiNER25BoundaryPooler(nn.Module):
 
         extras = extras[: len(sequences)]
         extras.extend({} for _ in range(len(sequences) - len(extras)))
-        if _can_batch_compact(extras):
-            return self._process_batch(sequences, extras)
+        # One head pass over several sequences can only carry one adapter.
+        if ctx.shares_one_adapter() and _can_batch_compact(extras):
+            with ctx.lora_scope(0):
+                return self._process_batch(sequences, extras)
 
         outputs: list[torch.Tensor | None] = []
-        for token_embs, extra in zip(sequences, extras, strict=True):
+        for index, (token_embs, extra) in enumerate(zip(sequences, extras, strict=True)):
             if not extra:
                 outputs.append(_pack_json({}, token_embs.device))
                 continue
-            outputs.append(self._process_one(token_embs, extra))
+            with ctx.lora_scope(index):
+                outputs.append(self._process_one(token_embs, extra))
         return outputs
 
     def _process_batch(

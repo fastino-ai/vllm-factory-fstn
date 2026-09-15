@@ -8,10 +8,33 @@ that implements ``FactoryPooler`` stays untouched.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 import torch
+
+NO_ADAPTER = -1
+
+
+@contextlib.contextmanager
+def _no_scope() -> Iterator[None]:
+    yield
+
+
+def null_lora_scope(seq_index: int) -> AbstractContextManager[None]:
+    """Return a scope that applies no adapter, for runs without LoRA.
+
+    Args:
+        seq_index: Position of the sequence in the scheduled batch.
+
+    Returns:
+        A context manager that does nothing.
+    """
+    del seq_index
+    return _no_scope()
 
 
 @dataclass
@@ -20,6 +43,12 @@ class PoolerContext:
 
     The adapter translates vLLM's ``PoolingMetadata`` into this before
     calling ``FactoryPooler.forward()``.
+
+    ``lora_scope`` is what binds head projections to the right adapter: a
+    pooler entering it for sequence ``i`` has every LoRA-wrapped head under it
+    apply that sequence's adapter, whatever shape the head projects. Head work
+    that mixes sequences must therefore first check that ``lora_slots`` holds
+    one value.
     """
 
     seq_lengths: list[int]
@@ -28,6 +57,12 @@ class PoolerContext:
     prompt_token_ids: list[torch.Tensor] = field(default_factory=list)
     device: torch.device | None = None
     dtype: torch.dtype | None = None
+    lora_slots: tuple[int, ...] = ()
+    lora_scope: Callable[[int], AbstractContextManager[None]] = null_lora_scope
+
+    def shares_one_adapter(self) -> bool:
+        """Return whether every scheduled sequence carries the same adapter."""
+        return len(set(self.lora_slots)) <= 1
 
 
 def split_hidden_states(

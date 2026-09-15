@@ -12,6 +12,8 @@ from types import ModuleType
 
 import torch
 
+from vllm_factory.pooling.protocol import PoolerContext
+
 
 def _decode(payload: torch.Tensor) -> dict:
     """Unpack a payload the way the IO processor does."""
@@ -20,13 +22,9 @@ def _decode(payload: torch.Tensor) -> dict:
     return json.loads(bytes(int(b) for b in data[1 : length + 1]).decode("utf-8"))
 
 
-class _Ctx:
-    """Minimal PoolerContext stand-in."""
-
-    def __init__(self, seq_lengths: list[int], extra_kwargs: list[dict]) -> None:
-        self.seq_lengths = seq_lengths
-        self.extra_kwargs = extra_kwargs
-        self.prompt_token_ids: list[list[int]] = []
+def _Ctx(seq_lengths: list[int], extra_kwargs: list[dict]) -> PoolerContext:
+    """Build a context for a batch running without adapters."""
+    return PoolerContext(seq_lengths=seq_lengths, extra_kwargs=extra_kwargs)
 
 
 def test_loading_the_pooler_leaves_no_stub_behind(pooler_mod: ModuleType):

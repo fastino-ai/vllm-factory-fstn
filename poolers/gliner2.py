@@ -167,7 +167,8 @@ class GLiNER2Pooler(nn.Module):
             if prompt_ids is not None and "input_ids" not in add:
                 add = {**add, "input_ids": prompt_ids}
 
-            result = self._process_single(tok, add)
+            with ctx.lora_scope(i):
+                result = self._process_single(tok, add)
             outputs.append(result)
 
         return outputs
