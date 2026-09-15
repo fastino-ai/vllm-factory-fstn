@@ -206,10 +206,10 @@ No plugin code participates in batching. Once each request carries its
 own `LoRARequest`, vLLM's scheduler (`vllm/v1/core/sched/scheduler.py`)
 groups requests with distinct `lora_int_id`s into a single step up to
 `--max-loras`, and the Punica SGMV kernels apply the correct delta per
-token in one fused forward pass. The pooler head (`span_rep` /
-`classifier` / `count_pred` / `count_embed`) is intentionally **not**
-adapter-eligible — only the DeBERTa backbone linears registered in
-[PR #11](https://github.com/ddickmann/vllm-factory/pull/11) receive LoRA.
+token in one fused forward pass. Encoder linears and task heads
+(`span_rep` / `classifier` / `count_pred` / `count_embed`) are both
+adapter-eligible: heads are converted to `ReplicatedLinear` so a
+multi-task-head PEFT adapter loads and is applied.
 
 ## Verify
 

@@ -12,7 +12,8 @@ def sequence_lengths(flat_ids: torch.Tensor, positions: torch.Tensor | None) -> 
     0, so the all-zero tail is trimmed first — a real sequence ends at position
     ``length - 1``, so the last nonzero position marks the last real token.
     Sequences of a single token are indistinguishable from padding and would be
-    dropped; boundary prompts always carry schema markers, so they never are.
+    dropped; schema-carrying prompts always hold more than one token, so they
+    never are.
 
     Args:
         flat_ids: Flat token ids for the whole batch, shape (total_tokens,).

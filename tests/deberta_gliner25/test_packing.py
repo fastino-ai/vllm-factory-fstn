@@ -2,7 +2,7 @@
 
 import torch
 
-from plugins.deberta_gliner25.packing import pad_batch, sequence_lengths
+from vllm_factory.packing import pad_batch, sequence_lengths
 
 
 def _packed(lengths: list[int], pad_slots: int = 0) -> tuple[torch.Tensor, torch.Tensor]:

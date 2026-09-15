@@ -18,6 +18,19 @@ from transformers import DebertaV2Config
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsLoRA
 
+from vllm_factory.lora.routing import (
+    BatchRouting,
+    encoder_scope,
+    find_punica_wrapper,
+    sequence_slots,
+    set_batch_routing,
+)
+from vllm_factory.packing import pad_batch, sequence_lengths
+from vllm_factory.pooling.lora_heads import (
+    SPAN_HEAD_NAMES,
+    convert_heads_to_replicated,
+    head_weights_mapper,
+)
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
 
 from .config import GLiNER2Config
@@ -53,9 +66,10 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
     walks through that attribute. PEFT adapters produced against the GLiNER2
     DeBERTa backbone (``target_modules=["query_proj", "key_proj",
     "value_proj"]`` by convention) are registered directly by layer name; no
-    packing rewrite is needed. The pooler head (``span_rep`` / ``classifier``
-    / ``count_pred`` / ``count_embed``) is **not** adapter-eligible in this
-    PR — GLiNER2 LoRA recipes adapt the transformer backbone only.
+    packing rewrite is needed. Task heads (``span_rep`` / ``classifier`` /
+    ``count_pred`` / ``count_embed``) are converted to ``ReplicatedLinear`` so
+    a multi-task-head adapter is loadable, and ``hf_to_vllm_mapper`` rewrites
+    PEFT's top-level head prefixes onto ``_business_pooler.``.
     """
 
     is_pooling_model = True
@@ -99,6 +113,7 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
 
         # 1. Backbone — custom DeBERTa v2 with Flash DeBERTa Triton kernel
         self.encoder = DebertaV2EncoderModel(config=encoder_cfg)
+        self._encoder_pad_id = int(cfg.encoder_pad_token_id or 0)
 
         # 2. GLiNER2 head (span_rep + count_embed + classifier + count_pred)
         # Imported here so register() stays import-safe without the gliner2 extra.
@@ -109,6 +124,8 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
             max_width=cfg.max_width,
             counting_layer=cfg.counting_layer,
         )
+        convert_heads_to_replicated(self._business_pooler, SPAN_HEAD_NAMES)
+        self.hf_to_vllm_mapper = head_weights_mapper(SPAN_HEAD_NAMES)
         self.pooler = VllmPoolerAdapter(self._business_pooler, requires_token_ids=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -132,15 +149,48 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
         inputs_embeds=None,
         **kwargs,
     ) -> torch.Tensor:
-        """Forward pass: encoder → hidden states (pooler applied by vLLM)."""
+        """Run the encoder over the scheduled batch and return flat hidden states.
+
+        vLLM hands a single flat token tensor holding every scheduled sequence
+        end to end. Feeding that straight to a bidirectional encoder would let
+        the sequences attend to each other, so it is reshaped into one padded
+        row per sequence before the forward and flattened back afterwards.
+
+        Args:
+            input_ids: Flat token ids for the whole batch, shape (total_tokens,).
+            positions: Per-sequence position ids, restarting at 0 each sequence.
+            intermediate_tensors: Unused; present for the vLLM model contract.
+            inputs_embeds: Unused; embeddings are taken from ``input_ids``.
+            **kwargs: Unused extras passed by the runner.
+
+        Returns:
+            Hidden states of shape (total_tokens, hidden_size), in the same
+            token order as ``input_ids``.
+        """
+        flat = input_ids.view(-1) if input_ids.dim() > 1 else input_ids
+        lengths = sequence_lengths(flat, positions)
+        wrapper = find_punica_wrapper(self)
+        slots = sequence_slots(wrapper, lengths)
+        set_batch_routing(BatchRouting(wrapper=wrapper, slots=tuple(slots)))
+
         with torch.no_grad():
-            hs = self.encoder(input_ids=input_ids)
+            if len(lengths) == 1:
+                width = lengths[0]
+                with encoder_scope(wrapper, slots, width):
+                    hs = self.encoder(input_ids=flat[:width].unsqueeze(0))
+            else:
+                ids, mask = pad_batch(flat, lengths, self._encoder_pad_id)
+                with encoder_scope(wrapper, slots, int(ids.shape[1])):
+                    hs = self.encoder(input_ids=ids, attention_mask=mask)
 
-        # Custom encoder returns tensor directly; flatten to 2D
-        if hs.dim() == 3:
-            hs = hs.squeeze(0)
-
-        return hs
+        packed = torch.cat([hs[row, :length] for row, length in enumerate(lengths)], dim=0)
+        # The runner pads the token count; give back a row per slot it sent.
+        total = int(flat.numel())
+        if packed.shape[0] == total:
+            return packed
+        out = packed.new_zeros((total, packed.shape[1]))
+        out[: packed.shape[0]] = packed
+        return out
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights from GLiNER2 checkpoint.

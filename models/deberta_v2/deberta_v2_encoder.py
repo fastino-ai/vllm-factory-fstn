@@ -35,6 +35,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsLoRA
 
+from vllm_factory.lora.routing import project_shared_table
+
 try:
     from kernels.flash_deberta_attention import HAS_TRITON, flash_deberta_attention
     HAS_FLASH_DEBERTA = HAS_TRITON
@@ -212,6 +214,21 @@ class DisentangledSelfAttentionV2(nn.Module):
         x = x.view(new_x_shape)
         return x.permute(0, 2, 1, 3)
 
+    def _tile_pos_layer(self, projected: torch.Tensor, batch_rows: int) -> torch.Tensor:
+        """Lay a position projection out to match the query rows' bmm layout.
+
+        Args:
+            projected: Position projection, a single row when one adapter
+                covers the batch and one row per sequence otherwise.
+            batch_rows: Number of sequence rows the attention scores span.
+
+        Returns:
+            The projection as (batch_rows * heads, entries, head_dim).
+        """
+        layer = self.transpose_for_scores(projected)
+        repeat = batch_rows // projected.size(0)
+        return layer.repeat(repeat, 1, 1) if repeat > 1 else layer
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -272,30 +289,21 @@ class DisentangledSelfAttentionV2(nn.Module):
         pos_key = None
         pos_query = None
 
-        if self.share_att_key:
-            if "c2p" in self.pos_att_type:
-                pos_key_layer_out, _ = self.key_proj(rel_emb)
-                pos_key_layer = self._transpose_4d(pos_key_layer_out)  # (1, H, 2*att_span, D)
-                pos_key = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2))
-            if "p2c" in self.pos_att_type:
-                pos_query_layer_out, _ = self.query_proj(rel_emb)
-                pos_query_layer = self._transpose_4d(pos_query_layer_out)
-                # NOTE: Do NOT pre-scale — kernel handles scaling via sm_scale
-                pos_query = torch.matmul(
-                    key_layer, pos_query_layer.transpose(-1, -2).to(dtype=key_layer.dtype)
-                )
-        else:
-            if "c2p" in self.pos_att_type:
-                pos_key_layer_out, _ = self.pos_key_proj(rel_emb)
-                pos_key_layer = self._transpose_4d(pos_key_layer_out)
-                pos_key = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2))
-            if "p2c" in self.pos_att_type:
-                pos_query_layer_out, _ = self.pos_query_proj(rel_emb)
-                pos_query_layer = self._transpose_4d(pos_query_layer_out)
-                # NOTE: Do NOT pre-scale — kernel handles scaling via sm_scale
-                pos_query = torch.matmul(
-                    key_layer, pos_query_layer.transpose(-1, -2).to(dtype=key_layer.dtype)
-                )
+        batch_rows = query_layer.size(0)
+        key_layer_proj = self.key_proj if self.share_att_key else self.pos_key_proj
+        query_layer_proj = self.query_proj if self.share_att_key else self.pos_query_proj
+
+        if "c2p" in self.pos_att_type:
+            pos_key_layer_out = project_shared_table(key_layer_proj, rel_emb, batch_rows)
+            pos_key_layer = self._transpose_4d(pos_key_layer_out)  # (rows, H, 2*att_span, D)
+            pos_key = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2))
+        if "p2c" in self.pos_att_type:
+            pos_query_layer_out = project_shared_table(query_layer_proj, rel_emb, batch_rows)
+            pos_query_layer = self._transpose_4d(pos_query_layer_out)
+            # NOTE: Do NOT pre-scale — kernel handles scaling via sm_scale
+            pos_query = torch.matmul(
+                key_layer, pos_query_layer.transpose(-1, -2).to(dtype=key_layer.dtype)
+            )
 
         # Build seq_lengths from attention_mask
         M = query_layer.size(2)
@@ -419,32 +427,20 @@ class DisentangledSelfAttentionV2(nn.Module):
 
         rel_embeddings = rel_embeddings[0 : att_span * 2, :].unsqueeze(0)
 
-        if self.share_att_key:
-            pos_query_layer_out, _ = self.query_proj(rel_embeddings)
-            pos_query_layer = self.transpose_for_scores(pos_query_layer_out)
-            pos_query_layer = pos_query_layer.repeat(
-                query_layer.size(0) // self.heads_per_partition, 1, 1
+        batch_rows = query_layer.size(0) // self.heads_per_partition
+        pos_key_layer = None
+        pos_query_layer = None
+
+        if self.share_att_key or "p2c" in self.pos_att_type:
+            proj = self.query_proj if self.share_att_key else self.pos_query_proj
+            pos_query_layer = self._tile_pos_layer(
+                project_shared_table(proj, rel_embeddings, batch_rows), batch_rows
             )
-            pos_key_layer_out, _ = self.key_proj(rel_embeddings)
-            pos_key_layer = self.transpose_for_scores(pos_key_layer_out)
-            pos_key_layer = pos_key_layer.repeat(
-                query_layer.size(0) // self.heads_per_partition, 1, 1
+        if self.share_att_key or "c2p" in self.pos_att_type:
+            proj = self.key_proj if self.share_att_key else self.pos_key_proj
+            pos_key_layer = self._tile_pos_layer(
+                project_shared_table(proj, rel_embeddings, batch_rows), batch_rows
             )
-        else:
-            pos_key_layer = None
-            pos_query_layer = None
-            if "c2p" in self.pos_att_type:
-                pos_key_layer_out, _ = self.pos_key_proj(rel_embeddings)
-                pos_key_layer = self.transpose_for_scores(pos_key_layer_out)
-                pos_key_layer = pos_key_layer.repeat(
-                    query_layer.size(0) // self.heads_per_partition, 1, 1
-                )
-            if "p2c" in self.pos_att_type:
-                pos_query_layer_out, _ = self.pos_query_proj(rel_embeddings)
-                pos_query_layer = self.transpose_for_scores(pos_query_layer_out)
-                pos_query_layer = pos_query_layer.repeat(
-                    query_layer.size(0) // self.heads_per_partition, 1, 1
-                )
 
         score = 0
 

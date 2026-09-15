@@ -18,10 +18,23 @@ from transformers import DebertaV2Config
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsLoRA
 
+from vllm_factory.lora.routing import (
+    BatchRouting,
+    encoder_scope,
+    find_punica_wrapper,
+    sequence_slots,
+    set_batch_routing,
+)
+from vllm_factory.packing import pad_batch, sequence_lengths
+from vllm_factory.pooling.lora_heads import (
+    BOUNDARY_HEAD_NAMES,
+    convert_heads_to_replicated,
+    head_weights_mapper,
+    present_head_names,
+)
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
 
 from .config import GLiNER25Config
-from .packing import pad_batch, sequence_lengths
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +65,14 @@ _ENCODER_EMBEDDING_MODULES: dict[str, str] = _encoder_mod.EMBEDDING_MODULES
 
 
 class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
-    """Boundary GLiNER 2.5: Flash DeBERTa encoder + gliner2 heads."""
+    """Boundary GLiNER 2.5: Flash DeBERTa encoder + gliner2 heads.
+
+    Encoder LoRA metadata is re-exported under ``encoder.``. Task heads
+    (``classifier`` / ``boundary_head`` / ``record_decoder`` /
+    ``relation_scorer`` when present) are converted to ``ReplicatedLinear``
+    so a multi-task-head adapter is loadable, and ``hf_to_vllm_mapper``
+    rewrites PEFT's top-level head prefixes onto ``_business_pooler.``.
+    """
 
     is_pooling_model = True
     supports_lora: ClassVar[bool] = True
@@ -102,6 +122,9 @@ class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
             tokenizer_name=vllm_config.model_config.model,
             max_model_len=getattr(vllm_config.model_config, "max_model_len", None),
         )
+        head_names = present_head_names(self._business_pooler, BOUNDARY_HEAD_NAMES)
+        convert_heads_to_replicated(self._business_pooler, head_names)
+        self.hf_to_vllm_mapper = head_weights_mapper(head_names)
         self.pooler = VllmPoolerAdapter(self._business_pooler, requires_token_ids=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -143,13 +166,19 @@ class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
         """
         flat = input_ids.view(-1) if input_ids.dim() > 1 else input_ids
         lengths = sequence_lengths(flat, positions)
+        wrapper = find_punica_wrapper(self)
+        slots = sequence_slots(wrapper, lengths)
+        set_batch_routing(BatchRouting(wrapper=wrapper, slots=tuple(slots)))
 
         with torch.no_grad():
             if len(lengths) == 1:
-                hs = self.encoder(input_ids=flat[: lengths[0]].unsqueeze(0))
+                width = lengths[0]
+                with encoder_scope(wrapper, slots, width):
+                    hs = self.encoder(input_ids=flat[:width].unsqueeze(0))
             else:
                 ids, mask = pad_batch(flat, lengths, self._encoder_pad_id)
-                hs = self.encoder(input_ids=ids, attention_mask=mask)
+                with encoder_scope(wrapper, slots, int(ids.shape[1])):
+                    hs = self.encoder(input_ids=ids, attention_mask=mask)
 
         packed = torch.cat([hs[row, :length] for row, length in enumerate(lengths)], dim=0)
         # The runner pads the token count; give back a row per slot it sent.
