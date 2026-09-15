@@ -18,6 +18,11 @@ from transformers import DebertaV2Config
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsLoRA
 
+from vllm_factory.pooling.lora_heads import (
+    SPAN_HEAD_NAMES,
+    convert_heads_to_replicated,
+    head_weights_mapper,
+)
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
 
 from .config import GLiNER2Config
@@ -53,9 +58,10 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
     walks through that attribute. PEFT adapters produced against the GLiNER2
     DeBERTa backbone (``target_modules=["query_proj", "key_proj",
     "value_proj"]`` by convention) are registered directly by layer name; no
-    packing rewrite is needed. The pooler head (``span_rep`` / ``classifier``
-    / ``count_pred`` / ``count_embed``) is **not** adapter-eligible in this
-    PR — GLiNER2 LoRA recipes adapt the transformer backbone only.
+    packing rewrite is needed. Task heads (``span_rep`` / ``classifier`` /
+    ``count_pred`` / ``count_embed``) are converted to ``ReplicatedLinear`` so
+    a multi-task-head adapter is loadable, and ``hf_to_vllm_mapper`` rewrites
+    PEFT's top-level head prefixes onto ``_business_pooler.``.
     """
 
     is_pooling_model = True
@@ -109,6 +115,8 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
             max_width=cfg.max_width,
             counting_layer=cfg.counting_layer,
         )
+        convert_heads_to_replicated(self._business_pooler, SPAN_HEAD_NAMES)
+        self.hf_to_vllm_mapper = head_weights_mapper(SPAN_HEAD_NAMES)
         self.pooler = VllmPoolerAdapter(self._business_pooler, requires_token_ids=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

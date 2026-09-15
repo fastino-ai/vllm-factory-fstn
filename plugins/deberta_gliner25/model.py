@@ -18,6 +18,12 @@ from transformers import DebertaV2Config
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsLoRA
 
+from vllm_factory.pooling.lora_heads import (
+    BOUNDARY_HEAD_NAMES,
+    convert_heads_to_replicated,
+    head_weights_mapper,
+    present_head_names,
+)
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
 
 from .config import GLiNER25Config
@@ -52,7 +58,14 @@ _ENCODER_EMBEDDING_MODULES: dict[str, str] = _encoder_mod.EMBEDDING_MODULES
 
 
 class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
-    """Boundary GLiNER 2.5: Flash DeBERTa encoder + gliner2 heads."""
+    """Boundary GLiNER 2.5: Flash DeBERTa encoder + gliner2 heads.
+
+    Encoder LoRA metadata is re-exported under ``encoder.``. Task heads
+    (``classifier`` / ``boundary_head`` / ``record_decoder`` /
+    ``relation_scorer`` when present) are converted to ``ReplicatedLinear``
+    so a multi-task-head adapter is loadable, and ``hf_to_vllm_mapper``
+    rewrites PEFT's top-level head prefixes onto ``_business_pooler.``.
+    """
 
     is_pooling_model = True
     supports_lora: ClassVar[bool] = True
@@ -102,6 +115,9 @@ class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
             tokenizer_name=vllm_config.model_config.model,
             max_model_len=getattr(vllm_config.model_config, "max_model_len", None),
         )
+        head_names = present_head_names(self._business_pooler, BOUNDARY_HEAD_NAMES)
+        convert_heads_to_replicated(self._business_pooler, head_names)
+        self.hf_to_vllm_mapper = head_weights_mapper(head_names)
         self.pooler = VllmPoolerAdapter(self._business_pooler, requires_token_ids=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
