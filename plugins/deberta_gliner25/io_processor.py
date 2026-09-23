@@ -2,25 +2,22 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 from transformers import AutoTokenizer
 from vllm.config import VllmConfig
 
-from gliner2.inference.runtime import format_results as gliner2_format_results
-
-from plugins.deberta_gliner2.processor import normalize_gliner2_schema
 from plugins.deberta_gliner25.processor import (
+    RUNTIMES,
     boundary_transformer,
     collate_word_cap,
     decode_boundary_output,
     iter_boundary_items,
     preprocess_boundary,
-    schema_format_args,
+    prompt_schema,
 )
 from vllm_factory.io.base import (
     FactoryIOProcessor,
@@ -29,15 +26,18 @@ from vllm_factory.io.base import (
     TokensPrompt,
 )
 
-logger = logging.getLogger(__name__)
-
 _ADAPTER_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-:/]{1,128}$")
+RuntimeName = Literal["classic", "constrained_classification", "joint_ie"]
 
 
 @dataclass
 class GLiNER25Input:
+    """One validated pooling item."""
+
     text: str
     schema: Dict = field(default_factory=dict)
+    prompt: Dict = field(default_factory=dict)
+    runtime: RuntimeName = "classic"
     threshold: float = 0.5
     include_confidence: bool = False
     include_spans: bool = False
@@ -56,7 +56,10 @@ class DeBERTaGLiNER25IOProcessor(FactoryIOProcessor):
         self._tokenizer = AutoTokenizer.from_pretrained(
             model_id, use_fast=True, trust_remote_code=True
         )
-        self._transformer = boundary_transformer(self._tokenizer)
+        token_pooling = getattr(vllm_config.model_config.hf_config, "token_pooling", "first")
+        self._transformer = boundary_transformer(
+            self._tokenizer, token_pooling=str(token_pooling or "first")
+        )
         raw_max = getattr(vllm_config.model_config, "max_model_len", None)
         self._max_model_len = int(raw_max) if raw_max else None
         self._word_cap = collate_word_cap(self._max_model_len)
@@ -82,7 +85,29 @@ class DeBERTaGLiNER25IOProcessor(FactoryIOProcessor):
             )
         return stripped
 
+    @staticmethod
+    def _coerce_runtime(value: Any) -> RuntimeName:
+        if value is None:
+            return "classic"
+        if value not in RUNTIMES:
+            raise ValueError(
+                "'runtime' must be classic, constrained_classification, or joint_ie"
+            )
+        return value
+
     def _parse_one(self, data: dict[str, Any]) -> GLiNER25Input:
+        """Validate one item and compile its schema for the encoder prompt.
+
+        Args:
+            data: One ``/pooling`` item.
+
+        Returns:
+            The parsed item. ``schema`` is the raw dict; ``prompt`` is what
+            collate encodes.
+
+        Raises:
+            ValueError: The item or its schema is invalid.
+        """
         text = data.get("text")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("'text' is required")
@@ -93,17 +118,21 @@ class DeBERTaGLiNER25IOProcessor(FactoryIOProcessor):
             raise ValueError("'threshold' must be a number") from exc
         if not 0.0 <= threshold <= 1.0:
             raise ValueError("'threshold' must be between 0 and 1")
+        runtime = self._coerce_runtime(data.get("runtime", "classic"))
         raw_schema = data.get("schema")
         labels = data.get("labels")
-        if raw_schema is not None:
-            schema = normalize_gliner2_schema(raw_schema)
-        elif labels is not None:
-            schema = normalize_gliner2_schema({"entities": labels})
-        else:
+        if raw_schema is None and labels is not None:
+            if runtime != "classic":
+                raise ValueError("'labels' is only valid when runtime is classic")
+            raw_schema = {"entities": labels}
+        elif raw_schema is None:
             raise ValueError("Request must include schema or labels")
+        prompt = prompt_schema(runtime, raw_schema)
         return GLiNER25Input(
             text=text,
-            schema=schema,
+            schema=raw_schema,
+            prompt=prompt,
+            runtime=runtime,
             threshold=threshold,
             include_confidence=self._coerce_bool(
                 data.get("include_confidence", False), "include_confidence"
@@ -144,12 +173,14 @@ class DeBERTaGLiNER25IOProcessor(FactoryIOProcessor):
 
         Returns:
             The prompt to schedule, the pooler's compact extras, and the
-            metadata ``factory_post_process`` decodes that sequence with.
+            metadata ``factory_post_process`` uses for that sequence.
         """
         result = preprocess_boundary(
             self._tokenizer,
             parsed_input.text,
             parsed_input.schema,
+            prompt=parsed_input.prompt,
+            runtime=parsed_input.runtime,
             threshold=parsed_input.threshold,
             include_confidence=parsed_input.include_confidence,
             include_spans=parsed_input.include_spans,
@@ -160,9 +191,6 @@ class DeBERTaGLiNER25IOProcessor(FactoryIOProcessor):
         )
         postprocess_meta = {
             "schema_dict": parsed_input.schema,
-            "threshold": parsed_input.threshold,
-            "include_confidence": parsed_input.include_confidence,
-            "include_spans": parsed_input.include_spans,
             "adapter": parsed_input.adapter,
         }
         prompt = TokensPrompt(prompt_token_ids=result["input_ids"])
@@ -210,7 +238,7 @@ class DeBERTaGLiNER25IOProcessor(FactoryIOProcessor):
         model_output: Sequence[PoolingRequestOutput],
         request_meta: Any,
     ) -> Dict | list[Dict]:
-        """Decode each pooled output with the metadata of its own sequence.
+        """Return each sequence's pooler JSON, echoing its adapter.
 
         Args:
             model_output: Pooler outputs, one per scheduled prompt.
@@ -218,8 +246,7 @@ class DeBERTaGLiNER25IOProcessor(FactoryIOProcessor):
                 dict, or a list of them for a batch.
 
         Returns:
-            One formatted result, or a list of them for a batch, in request
-            order.
+            One result, or a list of them for a batch, in request order.
         """
         if not model_output or request_meta is None:
             return [] if isinstance(request_meta, list) else {}
@@ -230,22 +257,15 @@ class DeBERTaGLiNER25IOProcessor(FactoryIOProcessor):
             if raw is None:
                 results.append({})
                 continue
-            schema = meta.get("schema_dict") or {}
-            decoded = decode_boundary_output(raw, schema)
-            requested_relations, classification_tasks = schema_format_args(schema)
-            formatted = gliner2_format_results(
-                decoded,
-                include_confidence=meta.get("include_confidence", False),
-                requested_relations=requested_relations,
-                classification_tasks=classification_tasks,
-            )
-            if isinstance(formatted, dict) and meta.get("adapter") is not None:
-                formatted.setdefault("adapter", meta["adapter"])
-            results.append(formatted if isinstance(formatted, dict) else {})
+            decoded = decode_boundary_output(raw, meta.get("schema_dict") or {})
+            if isinstance(decoded, dict) and meta.get("adapter") is not None:
+                decoded.setdefault("adapter", meta["adapter"])
+            results.append(decoded if isinstance(decoded, dict) else {})
         if len(results) == 1:
             return results[0]
         return results
 
 
 def get_processor_cls() -> str:
+    """Return the IO processor class path vLLM loads."""
     return "plugins.deberta_gliner25.io_processor.DeBERTaGLiNER25IOProcessor"

@@ -46,18 +46,19 @@ def test_gliner25_plugin_model_prefixes_backbone_mapping():
     assert set(GLiNER25VLLMModel.embedding_modules) == expected_embed_keys
 
 
-def test_gliner25_plugin_maps_task_heads_onto_the_pooler_path():
+def test_gliner25_plugin_maps_task_heads_onto_the_extractor():
+    from plugins.deberta_gliner25.model import EXTRACTOR_LORA_PREFIX
     from vllm_factory.pooling.lora_heads import BOUNDARY_HEAD_NAMES, head_weights_mapper
 
-    mapper = head_weights_mapper(BOUNDARY_HEAD_NAMES)
+    mapper = head_weights_mapper(BOUNDARY_HEAD_NAMES, prefix=EXTRACTOR_LORA_PREFIX)
     assert mapper._map_name("classifier.3.lora_A.weight") == (
-        "_business_pooler.classifier.3.lora_A.weight"
+        "_business_pooler.extractor.classifier.3.lora_A.weight"
     )
     assert mapper._map_name("boundary_head.pair_scorer.compat_mix.lora_B.weight") == (
-        "_business_pooler.boundary_head.pair_scorer.compat_mix.lora_B.weight"
+        "_business_pooler.extractor.boundary_head.pair_scorer.compat_mix.lora_B.weight"
     )
     assert mapper._map_name("record_decoder.q_proj.weight") == (
-        "_business_pooler.record_decoder.q_proj.weight"
+        "_business_pooler.extractor.record_decoder.q_proj.weight"
     )
     assert BOUNDARY_HEAD_NAMES == (
         "classifier",

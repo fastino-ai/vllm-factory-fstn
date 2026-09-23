@@ -5,7 +5,7 @@ from pathlib import Path
 
 from gliner2.inference.runtime import format_results
 
-from plugins.deberta_gliner25.processor import schema_format_args
+from plugins.deberta_gliner25.processor import prompt_schema
 
 
 def test_format_results_merges_entity_list_of_dicts():
@@ -21,15 +21,28 @@ def test_format_results_merges_entity_list_of_dicts():
     assert "relations" not in out
 
 
-def test_schema_format_args_reads_tasks_and_relations():
-    rels, tasks = schema_format_args(
+def test_relation_prompt_key_is_the_declared_name():
+    """ENG-7601: a relation dict must not become a stringified output key."""
+    prompt = prompt_schema(
+        "classic",
         {
-            "classifications": [{"task": "topic", "labels": ["a"]}],
-            "relations": {"works_at": "", "located_in": ""},
-        }
+            "entities": ["person", "organization"],
+            "relations": {"works_for": "employment"},
+        },
     )
-    assert tasks == ["topic"]
-    assert rels == ["works_at", "located_in"]
+    assert prompt["relations"] == [{"works_for": {"head": "", "tail": ""}}]
+
+    joint = prompt_schema(
+        "joint_ie",
+        {
+            "entities": ["person", "organization"],
+            "relations": {
+                "works_for": {"head": "person", "tail": "organization"},
+            },
+        },
+    )
+    assert "works_for" in joint["relations"][0]
+    assert not any(key.startswith("{") for item in joint["relations"] for key in item)
 
 
 def test_format_results_accepts_json_decoded_classification_pair():

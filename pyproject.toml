@@ -37,7 +37,7 @@ gliner = [
     "gliner>=0.2.26",
 ]
 gliner2 = [
-    "gliner2>=2.0.0",
+    "gliner2>=2.1.0",
 ]
 glinker = [
     "gliner>=0.2.26",
@@ -61,7 +61,7 @@ kernels = [
 ]
 all = [
     "gliner>=0.2.26",
-    "gliner2>=2.0.0",
+    "gliner2>=2.1.0",
     "glinker>=0.1.0",
     "matplotlib>=3.7",
     "aiohttp>=3.9",

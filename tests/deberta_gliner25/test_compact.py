@@ -41,7 +41,20 @@ def test_compact_extra_has_no_routing_tensors():
     assert is_compact_extra(extra)
     assert "text_word_indices" not in extra
     assert extra["text"] == "Ada visited Berlin."
+    assert extra["runtime"] == "classic"
     assert extra["max_len"] == 3968
+
+
+def test_compact_extra_round_trips_runtime():
+    extra = compact_boundary_extra(
+        "Delete the file",
+        {"tasks": {"intent": {"labels": ["keep", "delete"]}}},
+        runtime="constrained_classification",
+        threshold=0.5,
+    )
+    assert is_compact_extra(extra)
+    assert extra["runtime"] == "constrained_classification"
+    assert extra["schema"]["tasks"]["intent"]["labels"] == ["keep", "delete"]
 
 
 def test_legacy_routing_extra_is_not_compact():

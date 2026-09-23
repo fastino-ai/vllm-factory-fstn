@@ -1,16 +1,13 @@
 """GLiNER 2.5 boundary pooler.
 
-Holds real ``gliner2`` head modules (never a copy) under the checkpoint
-prefixes ``boundary_head`` / ``record_decoder`` / ``relation_scorer`` /
-``classifier``. vLLM hidden states replace the encoder call; decode is
-delegated to ``BoundaryExtractor._extract_from_batch``.
+vLLM runs the encoder. This module groups sequences and hands the hidden
+states to GLiNER2's own batch APIs.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import fields
 from typing import Any
 
 import torch
@@ -20,6 +17,8 @@ from vllm_factory.pooling.protocol import PoolerContext, split_hidden_states
 
 logger = logging.getLogger(__name__)
 
+RUNTIMES = ("classic", "constrained_classification", "joint_ie")
+
 
 def _require(module: str, purpose: str):
     from vllm_factory.optional_deps import require
@@ -27,125 +26,75 @@ def _require(module: str, purpose: str):
     return require(module, "gliner2", purpose=purpose)
 
 
-def _decode_key(extra: dict[str, Any]) -> tuple[bool, bool, float, int]:
-    """Settings that must match for sequences to decode in one collate."""
+def _group_key(extra: dict[str, Any]) -> tuple[Any, ...]:
+    """Return the settings that must match for one GLiNER2 batch call.
+
+    Args:
+        extra: Compact extras for one sequence.
+
+    Returns:
+        ``(runtime, threshold, include_confidence, include_spans, max_len)``.
+    """
+    max_len = extra.get("max_len")
     return (
+        str(extra.get("runtime") or "classic"),
+        float(extra.get("threshold", 0.5)),
         bool(extra.get("include_confidence", False)),
         bool(extra.get("include_spans", False)),
-        float(extra.get("threshold", 0.5)),
-        int(extra.get("max_len") or 0),
+        None if max_len is None else int(max_len),
     )
 
 
-def _can_batch_compact(extras: list[dict[str, Any]]) -> bool:
-    """True when every extra is compact and shares one decode key.
+def _sequence_groups(
+    ctx: PoolerContext, extras: list[dict[str, Any]]
+) -> list[list[int]]:
+    """Group sequence indexes that can share one GLiNER2 call.
 
     Args:
-        extras: Per-sequence extras in scheduled order.
+        ctx: Scheduled batch context, including adapter slots.
+        extras: Per-sequence extras aligned with the scheduled batch.
 
     Returns:
-        Whether the batch can be re-collated in one call. ``_extract_from_batch``
-        takes a single threshold and flag set, and the word cap has to match or
-        the re-collated rows would not line up with the encoded tokens.
+        Groups of indexes. A mixed-adapter batch is one sequence per group.
+        Empty extras are omitted.
     """
-    if not extras or any(not extra for extra in extras):
-        return False
-    from plugins.deberta_gliner25.processor import is_compact_extra
-
-    if not all(is_compact_extra(extra) for extra in extras):
-        return False
-    first = _decode_key(extras[0])
-    return all(_decode_key(extra) == first for extra in extras)
+    pending = [index for index, extra in enumerate(extras) if extra]
+    if not ctx.shares_one_adapter():
+        return [[index] for index in pending]
+    grouped: dict[tuple[Any, ...], list[int]] = {}
+    for index in pending:
+        grouped.setdefault(_group_key(extras[index]), []).append(index)
+    return list(grouped.values())
 
 
 class GLiNER25BoundaryPooler(nn.Module):
-    """Boundary heads + serving split/pack. Does not subclass gliner2 types."""
+    """Encoder-less GLiNER2 boundary model plus the two non-classic facades."""
 
-    def __init__(
-        self,
-        hidden_size: int,
-        boundary_head: dict[str, Any] | None = None,
-        tokenizer_name: str | None = None,
-        max_model_len: int | None = None,
-    ):
+    def __init__(self, *, config: Any, encoder_config: Any, tokenizer: Any) -> None:
+        """Build heads once from the checkpoint config.
+
+        Args:
+            config: GLiNER2 ``ExtractorConfig`` with ``architecture="boundary"``.
+            encoder_config: Config whose ``hidden_size`` matches the vLLM encoder.
+            tokenizer: Tokenizer the extractor collates with.
+        """
         super().__init__()
-        cfg = dict(boundary_head or {})
-        layers = _require("gliner2.layers", "GLiNER25 classifier")
-        model_mod = _require("gliner2.models.boundary.model", "GLiNER25 boundary head")
-        config_mod = _require("gliner2.configuration", "GLiNER25 boundary settings")
-        records_mod = _require("gliner2.models.boundary.records", "GLiNER25 record decoder")
-        relations_mod = _require("gliner2.models.boundary.relations", "GLiNER25 relation scorer")
-
-        settings_cls = config_mod.BoundaryHeadSettings
-        allowed = {item.name for item in fields(settings_cls)}
-        self.boundary_settings = settings_cls(
-            **{key: value for key, value in cfg.items() if key in allowed}
+        engine = _require("gliner2.inference.engine", "GLiNER25 boundary extractor")
+        classification = _require("gliner2.classification", "GLiNER25 classifier")
+        joint = _require("gliner2.joint_ie", "GLiNER25 joint IE")
+        self.extractor = engine.BoundaryExtractor(
+            config,
+            encoder_config=encoder_config,
+            tokenizer=tokenizer,
+            load_encoder=False,
         )
-        self.hidden_size = hidden_size
-        self.enable_records = bool(self.boundary_settings.enable_records)
-        self.enable_relations = bool(self.boundary_settings.enable_relations)
-        self._tokenizer_name = tokenizer_name
-        self._max_model_len = max_model_len
-        self._tokenizer = None
-        self._transformer = None
-
-        self.classifier = layers.create_mlp(
-            input_dim=hidden_size,
-            intermediate_dims=[hidden_size * 2],
-            output_dim=1,
-            dropout=cfg.get("dropout", 0.1),
-            activation="relu",
-            add_layer_norm=False,
-        )
-        self.boundary_head = model_mod.BoundaryHead(
-            hidden_size,
-            self.boundary_settings,
-            query_dim=hidden_size,
-            build_candidate_states=self.enable_records,
-        )
-        if self.enable_records:
-            self.record_decoder = records_mod.RecordHead(
-                hidden_size,
-                self.boundary_settings.record_dim,
-                self.boundary_settings.record_instance_queries,
-            )
-        if self.enable_relations:
-            self.relation_pair_generator = relations_mod.TypedRelationPairGenerator(
-                relations_mod.RelationProposalSettings(
-                    heads_per_relation=self.boundary_settings.relation_heads_per_type,
-                    tails_per_relation=self.boundary_settings.relation_tails_per_type,
-                    pair_cap=self.boundary_settings.relation_pair_cap,
-                    argument_threshold=self.boundary_settings.relation_argument_proposal_threshold,
-                )
-            )
-            self.relation_scorer = relations_mod.SparseRelationScorer(
-                hidden_size,
-                dropout=self.boundary_settings.dropout,
-                relation_query_dim=(
-                    2 * hidden_size
-                    if self.boundary_settings.directional_relation_states
-                    else hidden_size
-                ),
-                use_biaffine_content=self.boundary_settings.relation_biaffine_content,
-            )
-
-    def _get_transformer(self) -> Any:
-        if self._transformer is None:
-            if not self._tokenizer_name:
-                raise RuntimeError(
-                    "GLiNER25 pooler has no tokenizer_name; cannot reconstruct compact extras"
-                )
-            from transformers import AutoTokenizer
-
-            from plugins.deberta_gliner25.processor import boundary_transformer
-
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self._tokenizer_name, use_fast=True, trust_remote_code=True
-            )
-            self._transformer = boundary_transformer(self._tokenizer)
-        return self._transformer
+        self.extractor.eval()
+        self.task_classifier = classification.Classifier(self.extractor)
+        self.joint_engine = joint.JointIEEngine(self.extractor)
+        self._runtime_device: tuple[torch.device, torch.dtype] | None = None
 
     def get_tasks(self) -> set[str]:
+        """Return the pooling tasks this pooler serves."""
         return {"embed", "classify", "plugin"}
 
     def forward(
@@ -161,9 +110,7 @@ class GLiNER25BoundaryPooler(nn.Module):
                 extras, in the same order.
 
         Returns:
-            One packed JSON payload per scheduled sequence. The count is the
-            contract: a batch holds several callers, so returning fewer pairs
-            results with the wrong requests.
+            One packed JSON payload per scheduled sequence.
         """
         extras = list(ctx.extra_kwargs)
         device = hidden_states.device
@@ -173,238 +120,193 @@ class GLiNER25BoundaryPooler(nn.Module):
             logger.exception("[GLiNER25] cannot split hidden states; returning empty")
             return _empty_payloads(len(extras) or 1, device)
 
-        extras = extras[: len(sequences)]
-        extras.extend({} for _ in range(len(sequences) - len(extras)))
-        # One head pass over several sequences can only carry one adapter.
-        if ctx.shares_one_adapter() and _can_batch_compact(extras):
-            with ctx.lora_scope(0):
-                return self._process_batch(sequences, extras)
+        if len(extras) < len(sequences):
+            extras.extend({} for _ in range(len(sequences) - len(extras)))
+        else:
+            extras = extras[: len(sequences)]
 
-        outputs: list[torch.Tensor | None] = []
-        for index, (token_embs, extra) in enumerate(zip(sequences, extras, strict=True)):
+        outputs: list[torch.Tensor | None] = [None] * len(sequences)
+        for indices in _sequence_groups(ctx, extras):
+            with ctx.lora_scope(indices[0]):
+                packed = self._decode_group(
+                    [sequences[index] for index in indices],
+                    [extras[index] for index in indices],
+                )
+            if len(packed) != len(indices):
+                raise RuntimeError(
+                    f"decode returned {len(packed)} payloads for {len(indices)} sequences"
+                )
+            for index, payload in zip(indices, packed, strict=True):
+                outputs[index] = payload
+        for index, extra in enumerate(extras):
             if not extra:
-                outputs.append(_pack_json({}, token_embs.device))
-                continue
-            with ctx.lora_scope(index):
-                outputs.append(self._process_one(token_embs, extra))
+                outputs[index] = _pack_json({}, sequences[index].device)
+        if any(payload is None for payload in outputs):
+            raise RuntimeError("pooler left a sequence without a payload")
         return outputs
 
-    def _process_batch(
+    def _decode_group(
         self,
         sequences: list[torch.Tensor],
         extras: list[dict[str, Any]],
-    ) -> list[torch.Tensor | None]:
-        """Decode a whole scheduled batch through one collate and one head pass.
+    ) -> list[torch.Tensor]:
+        """Run one GLiNER2 batch call and pack each result.
 
         Args:
-            sequences: Per-sequence hidden states, in scheduled order.
-            extras: Compact extras sharing one decode key, same order.
+            sequences: Per-sequence hidden states, one ``(tokens, hidden)`` tensor.
+            extras: Compact extras sharing one group key, same order.
 
         Returns:
-            One packed JSON payload per sequence. Falls back to per-sequence
-            decode if the re-collated rows do not match the encoded lengths,
-            which would otherwise gather the wrong words.
-        """
-        device = sequences[0].device
-        dtype = sequences[0].dtype
-        batch = self._collate_compact(extras).to(device, dtype=dtype)
-        orig_lens = [int(x) for x in (getattr(batch, "original_lengths", None) or [])]
-        seq_lens = [int(seq.shape[0]) for seq in sequences]
-        if orig_lens and orig_lens != seq_lens:
-            logger.warning(
-                "[GLiNER25] collate lengths %s != encoder lengths %s; per-seq fallback",
-                orig_lens,
-                seq_lens,
-            )
-            return [self._process_one(seq, extra) for seq, extra in zip(sequences, extras)]
-        max_t = max(seq_lens)
-        padded = sequences[0].new_zeros(len(sequences), max_t, sequences[0].shape[-1])
-        for i, seq in enumerate(sequences):
-            padded[i, : seq.shape[0]] = seq
-        core = self._core_from_hidden(padded, batch)
-        host = self._decode_host(core)
-        threshold = float(extras[0].get("threshold", 0.5))
-        include_confidence = bool(extras[0].get("include_confidence", False))
-        include_spans = bool(extras[0].get("include_spans", False))
-        metadata = [{} for _ in extras]
-        samples = host._extract_from_batch(
-            batch, threshold, metadata, include_confidence, include_spans
-        )
-        return [_pack_json(sample if sample else {}, device) for sample in samples]
-
-    def _collate_compact(self, extras: list[dict[str, Any]]) -> Any:
-        from plugins.deberta_gliner25.processor import collate_compact_extras
-
-        return collate_compact_extras(self._tokenizer, extras, transformer=self._get_transformer())
-
-    def _process_one(self, token_embs: torch.Tensor, extra: dict[str, Any]) -> torch.Tensor:
-        """Decode one sequence.
-
-        Args:
-            token_embs: Hidden states for this sequence, shape (tokens, hidden).
-            extra: This sequence's compact extras.
-
-        Returns:
-            The packed JSON payload for this sequence.
+            One packed JSON payload per sequence.
 
         Raises:
-            ValueError: ``extra`` is not compact, which means the sequence was
-                handed the whole request's ``_per_seq`` payload instead of its
-                own slice.
+            ValueError: An extra is not compact, or its runtime is unknown.
         """
         from plugins.deberta_gliner25.processor import is_compact_extra
 
-        if not is_compact_extra(extra):
-            raise ValueError(f"expected compact extra_kwargs, got keys {sorted(extra)[:8]}")
-        batch = self._collate_compact([extra]).to(token_embs.device, dtype=token_embs.dtype)
-        core = self._core_from_hidden(token_embs.unsqueeze(0), batch)
-        host = self._decode_host(core)
-        samples = host._extract_from_batch(
-            batch,
-            float(extra.get("threshold", 0.5)),
-            [{}],
-            bool(extra.get("include_confidence", False)),
-            bool(extra.get("include_spans", False)),
-        )
-        sample = samples[0] if samples else {}
-        return _pack_json(sample, token_embs.device)
+        for extra in extras:
+            if not is_compact_extra(extra):
+                raise ValueError(f"expected compact extra_kwargs, got keys {sorted(extra)[:8]}")
+        sample = sequences[0]
+        self._bind_runtime(sample)
+        with torch.inference_mode():
+            results = self._run_runtime(sequences, extras)
+        return [_pack_json(result, sample.device) for result in results]
 
-    def _decode_host(self, core: dict[str, Any]) -> Any:
-        engine = _require("gliner2.models.boundary.engine", "GLiNER25 decode host")
-        # ``object.__new__`` skips ``nn.Module.__init__``, so attribute
-        # assignment must not go through ``Module.__setattr__`` (it raises
-        # ``cannot assign module before Module.__init__() call``).
-        host = object.__new__(engine.BoundaryExtractor)
-        for name, value in (
-            ("boundary_head", self.boundary_head),
-            ("boundary_settings", self.boundary_settings),
-            ("classifier", self.classifier),
-            ("enable_records", self.enable_records),
-            ("enable_relations", self.enable_relations),
-            ("record_decoder", getattr(self, "record_decoder", None)),
-            ("relation_scorer", getattr(self, "relation_scorer", None)),
-            ("relation_pair_generator", getattr(self, "relation_pair_generator", None)),
-            ("hidden_size", self.hidden_size),
-            ("strict_extraction", True),
-            ("_encode_core", lambda _batch: core),
-        ):
-            object.__setattr__(host, name, value)
-        return host
+    def _bind_runtime(self, sample: torch.Tensor) -> None:
+        """Point both facades at ``sample``'s device the first time it changes.
 
-    def _core_from_hidden(
-        self, token_embeddings: torch.Tensor, batch: Any
-    ) -> dict[str, Any]:
-        """Gather word/query/cls states from vLLM hidden states (fast routing)."""
-        h = token_embeddings.shape[-1]
+        Args:
+            sample: One hidden-state row from the scheduled batch.
+        """
+        placed = (sample.device, sample.dtype)
+        if self._runtime_device == placed:
+            return
+        self.task_classifier.to(device=sample.device, dtype=sample.dtype)
+        self.joint_engine.to(device=sample.device, dtype=sample.dtype)
+        self._runtime_device = placed
 
-        def gather_routed(indices: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-            safe_idx = indices.clamp(0, token_embeddings.shape[1] - 1)
-            states = token_embeddings.gather(1, safe_idx.unsqueeze(-1).expand(-1, -1, h))
-            return states * mask.unsqueeze(-1).to(states.dtype)
+    def _run_runtime(
+        self,
+        sequences: list[torch.Tensor],
+        extras: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Dispatch a group to the runtime's GLiNER2 batch API.
 
-        text_states = gather_routed(batch.text_word_indices, batch.text_word_mask)
-        query_states = gather_routed(batch.query_marker_indices, batch.query_marker_mask)
-        text_mask = batch.text_word_mask
-        query_mask = batch.query_marker_mask
-        cls_states = gather_routed(batch.cls_marker_indices, batch.cls_marker_mask)
+        Args:
+            sequences: Per-sequence hidden states.
+            extras: Compact extras for those sequences.
 
-        ext_specs: list[list[dict[str, Any]]] = []
-        cls_specs: list[list[dict[str, Any]]] = []
-        rel_specs: list[list[dict[str, Any]]] = []
-        word_offsets: list[int] = []
-        relations_mod = _require("gliner2.models.boundary.relations", "relation specs")
-        relation_spec_cls = relations_mod.RelationTypeSpec
+        Returns:
+            One result dict per sequence.
 
-        for i in range(len(batch)):
-            layout = batch.query_layouts[i]
-            specs_i = [
-                {
-                    "group_index": spec.task_index,
-                    "field_index": spec.role_index,
-                    "task_type": spec.task_type,
-                    "task_name": spec.task_name,
-                    "field_name": spec.role_name,
-                }
-                for spec in layout.queries
-            ]
-            ext_specs.append(specs_i)
-            text_len_i = (
-                len(batch.start_mappings[i])
-                if batch.start_mappings
-                else int(batch.text_word_counts[i])
+        Raises:
+            ValueError: ``runtime`` is not a hosted GLiNER2 runtime.
+        """
+        runtime, threshold, include_confidence, include_spans, max_len = _group_key(extras[0])
+        texts = [str(extra["text"]) for extra in extras]
+        schemas = [extra["schema"] for extra in extras]
+        if runtime == "classic":
+            return self._run_classic(
+                texts, schemas, sequences, threshold, include_confidence, include_spans, max_len
             )
-            word_offsets.append(max(int(batch.text_word_counts[i]) - text_len_i, 0))
+        if runtime == "constrained_classification":
+            return self._run_classification(
+                texts, schemas, sequences, include_confidence, max_len
+            )
+        if runtime == "joint_ie":
+            return self._run_joint(
+                texts, schemas, sequences, include_confidence, include_spans, max_len
+            )
+        raise ValueError(
+            "'runtime' must be classic, constrained_classification, or joint_ie"
+        )
 
-            cls_i: list[dict[str, Any]] = []
-            cls_offset = 0
-            for group_index in range(batch.schema_counts[i]):
-                if batch.task_types[i][group_index] != "classifications":
-                    continue
-                choice_count = max(len(batch.schema_special_indices[i][group_index]) - 1, 0)
-                if choice_count:
-                    schema_tokens = batch.schema_tokens_list[i][group_index]
-                    cls_i.append(
-                        {
-                            "group_index": group_index,
-                            "task_name": schema_tokens[2] if len(schema_tokens) > 2 else "",
-                            "schema_tokens": schema_tokens,
-                            "choice_states": cls_states[i, cls_offset : cls_offset + choice_count],
-                            "group_embs": torch.cat(
-                                (
-                                    cls_states.new_zeros((1, h)),
-                                    cls_states[i, cls_offset : cls_offset + choice_count],
-                                )
-                            ),
-                        }
-                    )
-                cls_offset += choice_count
-            cls_specs.append(cls_i)
+    def _run_classic(
+        self,
+        texts: list[str],
+        schemas: list[Any],
+        sequences: list[torch.Tensor],
+        threshold: float,
+        include_confidence: bool,
+        include_spans: bool,
+        max_len: int | None,
+    ) -> list[dict[str, Any]]:
+        schema_mod = _require("gliner2.inference.schema", "GLiNER25 schema parse")
+        parsed = [schema_mod.Schema.from_dict(schema) for schema in schemas]
+        return self.extractor.batch_extract(
+            texts,
+            parsed,
+            threshold=threshold,
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            max_len=max_len,
+            hidden_states=sequences,
+        )
 
-            rel_i: list[dict[str, Any]] = []
-            groups: dict[int, list[int]] = {}
-            for query_id, spec in enumerate(specs_i):
-                groups.setdefault(spec["group_index"], []).append(query_id)
-            for group_index, role_ids_list in groups.items():
-                if batch.task_types[i][group_index] != "relations":
-                    continue
-                role_ids = tuple(role_ids_list)
-                if len(role_ids) < 2:
-                    continue
-                head_id, tail_id = role_ids[:2]
-                max_q = query_states.shape[1] - 1
-                head_id = min(head_id, max_q)
-                tail_id = min(tail_id, max_q)
-                role_states = query_states[i, [head_id, tail_id]]
-                relation_state = (
-                    torch.cat((role_states[0], role_states[1]), dim=-1)
-                    if self.boundary_settings.directional_relation_states
-                    else role_states.mean(dim=0)
-                )
-                rel_i.append(
-                    {
-                        "group_index": group_index,
-                        "relation_type": specs_i[head_id]["task_name"],
-                        "spec": relation_spec_cls(
-                            specs_i[head_id]["task_name"],
-                            head_query_ids=(head_id,),
-                            tail_query_ids=(tail_id,),
-                        ),
-                        "query_state": relation_state,
-                    }
-                )
-            rel_specs.append(rel_i)
+    def _run_classification(
+        self,
+        texts: list[str],
+        schemas: list[Any],
+        sequences: list[torch.Tensor],
+        include_confidence: bool,
+        max_len: int | None,
+    ) -> list[dict[str, Any]]:
+        classification = _require("gliner2.classification", "GLiNER25 classifier")
+        parsed = [classification.ClassificationSchema.from_dict(schema) for schema in schemas]
+        config = classification.ClassificationConfig(
+            include_confidence=include_confidence,
+            max_len=max_len,
+        )
+        results = self.task_classifier.batch_classify(
+            texts, parsed, config=config, hidden_states=sequences
+        )
+        return [_as_dict(result) for result in results]
 
-        return {
-            "text_states": text_states,
-            "text_mask": text_mask,
-            "text_lengths": text_mask.sum(-1).long(),
-            "query_states": query_states,
-            "query_mask": query_mask,
-            "ext_specs": ext_specs,
-            "cls_specs": cls_specs,
-            "rel_specs": rel_specs,
-            "word_offsets": word_offsets,
-        }
+    def _run_joint(
+        self,
+        texts: list[str],
+        schemas: list[Any],
+        sequences: list[torch.Tensor],
+        include_confidence: bool,
+        include_spans: bool,
+        max_len: int | None,
+    ) -> list[dict[str, Any]]:
+        joint = _require("gliner2.joint_ie", "GLiNER25 joint IE")
+        schema_mod = _require("gliner2.joint_ie.schema", "GLiNER25 joint schema")
+        parsed = [schema_mod.JointSchema.from_dict(schema) for schema in schemas]
+        config = joint.JointIEConfig(
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            max_len=max_len,
+        )
+        results = self.joint_engine.batch_extract(
+            texts, parsed, config=config, hidden_states=sequences
+        )
+        return [_as_dict(result) for result in results]
+
+
+def _as_dict(result: Any) -> dict[str, Any]:
+    """Return a JSON-ready dict from a GLiNER2 result.
+
+    Args:
+        result: A dict or an object with ``to_dict()``.
+
+    Returns:
+        The result mapping.
+
+    Raises:
+        TypeError: The result cannot be turned into a dict.
+    """
+    if isinstance(result, dict):
+        return result
+    to_dict = getattr(result, "to_dict", None)
+    if not callable(to_dict):
+        raise TypeError(f"{type(result).__name__} has no to_dict")
+    converted = to_dict()
+    if not isinstance(converted, dict):
+        raise TypeError(f"{type(result).__name__}.to_dict() returned {type(converted).__name__}")
+    return converted
 
 
 def _pack_json(sample: dict[str, Any], device: torch.device) -> torch.Tensor:

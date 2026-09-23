@@ -1,4 +1,4 @@
-"""Boundary serving processor: GLiNER2 collate + Pioneer response keys."""
+"""Boundary serving processor: GLiNER2 schema parse and prompt collate."""
 
 from __future__ import annotations
 
@@ -7,13 +7,63 @@ from typing import Any
 from plugins.deberta_gliner2.processor import decode_output
 from vllm_factory.optional_deps import require
 
+RUNTIMES = ("classic", "constrained_classification", "joint_ie")
 _COMPACT_FLAG = "_compact"
 # Schema markers, separators and specials share the prompt with the text.
 _SCHEMA_TOKEN_HEADROOM = 128
 _FIT_ATTEMPTS = 3
 
 
-def boundary_transformer(tokenizer: Any) -> Any:
+def prompt_schema(runtime: str, schema: dict[str, Any]) -> dict[str, Any]:
+    """Parse ``schema`` with the runtime's GLiNER2 parser and return its prompt.
+
+    Args:
+        runtime: ``classic``, ``constrained_classification``, or ``joint_ie``.
+        schema: Raw schema dict accepted by that runtime's ``from_dict``.
+
+    Returns:
+        The dict GLiNER2 collates into the encoder prompt.
+
+    Raises:
+        ValueError: ``runtime`` or ``schema`` is not valid for that parser.
+    """
+    if runtime not in RUNTIMES:
+        raise ValueError(
+            "'runtime' must be classic, constrained_classification, or joint_ie"
+        )
+    if not isinstance(schema, dict):
+        raise ValueError("'schema' must be an object")
+    from pydantic import ValidationError
+
+    try:
+        return _compile_prompt(runtime, schema)
+    except (ValidationError, TypeError, KeyError) as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _compile_prompt(runtime: str, schema: dict[str, Any]) -> dict[str, Any]:
+    if runtime == "classic":
+        schema_mod = require(
+            "gliner2.inference.schema", "gliner2", purpose="GLiNER25 schema parse"
+        )
+        return schema_mod.Schema.from_dict(schema).build()
+    if runtime == "constrained_classification":
+        classification = require(
+            "gliner2.classification", "gliner2", purpose="GLiNER25 classification parse"
+        )
+        parsed = classification.ClassificationSchema.from_dict(schema)
+        return classification.compile_schema(parsed).build()
+    joint_schema = require(
+        "gliner2.joint_ie.schema", "gliner2", purpose="GLiNER25 joint schema parse"
+    )
+    compiler = require(
+        "gliner2.joint_ie.compiler", "gliner2", purpose="GLiNER25 joint compile"
+    )
+    parsed = joint_schema.JointSchema.from_dict(schema)
+    return compiler.compile_schema(parsed).build()
+
+
+def boundary_transformer(tokenizer: Any, *, token_pooling: str = "first") -> Any:
     """Build a SchemaTransformer bound to ``tokenizer``.
 
     Args:
@@ -26,7 +76,9 @@ def boundary_transformer(tokenizer: Any) -> Any:
     processor_mod = require(
         "gliner2.processor", "gliner2", purpose="GLiNER25 preprocess"
     )
-    return processor_mod.SchemaTransformer(tokenizer=tokenizer, token_pooling="first")
+    return processor_mod.SchemaTransformer(
+        tokenizer=tokenizer, token_pooling=token_pooling
+    )
 
 
 def collate_word_cap(max_model_len: int | None) -> int | None:
@@ -84,21 +136,22 @@ def compact_boundary_extra(
     text: str,
     schema: dict[str, Any],
     *,
+    runtime: str = "classic",
     threshold: float = 0.5,
     include_confidence: bool = False,
     include_spans: bool = False,
     max_len: int | None = None,
 ) -> dict[str, Any]:
-    """Metadata the GPU worker needs to re-collate routing tensors.
+    """Metadata the pooler needs to call GLiNER2 for one sequence.
 
-    This is what crosses vLLM V1 ZMQ — not the collate index tensors. The
-    worker must reproduce the frontend's token layout, so ``max_len`` records
-    the cap that was actually applied.
+    This crosses vLLM V1 ZMQ. ``max_len`` is the word cap the prompt collate
+    actually applied, so the pooler's collate lines up with the encoder tokens.
 
     Args:
         text: Input text to extract from.
-        schema: Normalized GLiNER2 schema.
-        threshold: Score threshold carried through to decode.
+        schema: Raw schema the pooler parses with ``from_dict``.
+        runtime: Which GLiNER2 batch API decodes this sequence.
+        threshold: Score threshold carried through to classic decode.
         include_confidence: Whether decode should return scores.
         include_spans: Whether decode should return character spans.
         max_len: Word cap applied during collate, or None when unbounded.
@@ -110,6 +163,7 @@ def compact_boundary_extra(
         _COMPACT_FLAG: True,
         "text": text,
         "schema": schema,
+        "runtime": runtime,
         "threshold": threshold,
         "include_confidence": include_confidence,
         "include_spans": include_spans,
@@ -131,6 +185,8 @@ def preprocess_boundary(
     text: str,
     schema: dict[str, Any],
     *,
+    prompt: dict[str, Any] | None = None,
+    runtime: str = "classic",
     threshold: float = 0.5,
     include_confidence: bool = False,
     include_spans: bool = False,
@@ -149,8 +205,10 @@ def preprocess_boundary(
     Args:
         tokenizer: Tokenizer used when ``transformer`` is not supplied.
         text: Input text to extract from.
-        schema: Normalized GLiNER2 schema.
-        threshold: Score threshold carried through to decode.
+        schema: Raw schema stored for the pooler.
+        prompt: Collate dict. Defaults to ``schema`` when the raw dict is the prompt.
+        runtime: Which GLiNER2 batch API decodes this sequence.
+        threshold: Score threshold carried through to classic decode.
         include_confidence: Whether decode should return scores.
         include_spans: Whether decode should return character spans.
         truncate_overflow_text: Whether text past the budget may be dropped.
@@ -166,10 +224,11 @@ def preprocess_boundary(
             truncation was not requested or it did not converge.
     """
     host = transformer if transformer is not None else boundary_transformer(tokenizer)
+    collate_schema = schema if prompt is None else prompt
     cap = word_cap if truncate_overflow_text else None
     for _ in range(_FIT_ATTEMPTS):
         batch = host.collate_fn_inference(
-            [(text, schema)],
+            [(text, collate_schema)],
             architecture="boundary",
             error_policy="raise",
             max_len=cap,
@@ -181,6 +240,7 @@ def preprocess_boundary(
                 "extra_kwargs": compact_boundary_extra(
                     text,
                     schema,
+                    runtime=runtime,
                     threshold=threshold,
                     include_confidence=include_confidence,
                     include_spans=include_spans,
@@ -206,98 +266,8 @@ def _tighter_word_cap(batch: Any, tokens: int, budget: int) -> int:
     return max(1, int(kept * budget / tokens) - 1)
 
 
-def collate_compact_extras(
-    tokenizer: Any,
-    extras: list[dict[str, Any]],
-    *,
-    transformer: Any = None,
-) -> Any:
-    """Collate compact extras into one GLiNER2 ``PreprocessedBatch``.
-
-    Args:
-        tokenizer: Tokenizer used when ``transformer`` is not supplied.
-        extras: Compact extras sharing one word cap, in sequence order.
-        transformer: SchemaTransformer to collate with, built if omitted.
-
-    Returns:
-        One batch whose per-row token layout matches what the frontend encoded.
-    """
-    host = transformer if transformer is not None else boundary_transformer(tokenizer)
-    rows = [(item["text"], item["schema"]) for item in extras]
-    word_cap = extras[0].get("max_len") if extras else None
-    if word_cap is not None:
-        word_cap = int(word_cap)
-    return host.collate_fn_inference(
-        rows,
-        architecture="boundary",
-        error_policy="raise",
-        max_len=word_cap,
-    )
-
-
-def reshape_boundary_output(sample: dict[str, Any]) -> dict[str, Any]:
-    """Map GLiNER2 decode keys onto Pioneer ``entities/classifications/structures/relations``."""
-    entities = sample.get("entities", {})
-    if isinstance(entities, list) and entities and isinstance(entities[0], dict):
-        merged: dict[str, Any] = {}
-        for item in entities:
-            merged.update(item)
-        entities = merged
-    classifications: dict[str, Any] = {}
-    structures: dict[str, Any] = {}
-    relations: dict[str, Any] = {}
-    for key, value in sample.items():
-        if key == "entities":
-            continue
-        if _is_relation_payload(value):
-            relations[key] = value
-        elif isinstance(value, list) and value and isinstance(value[0], dict):
-            structures[key] = value
-        else:
-            classifications[key] = value
-    return {
-        "entities": entities or {},
-        "classifications": classifications,
-        "structures": structures,
-        "relations": relations,
-    }
-
-
-def _is_relation_payload(value: Any) -> bool:
-    if not isinstance(value, list) or not value or not isinstance(value[0], dict):
-        return False
-    keys = set(value[0])
-    return bool(keys & {"head", "tail", "subject", "object", "src", "dst"})
-
-
 def decode_boundary_output(
     raw_output, schema: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """Unpack the JSON byte tensor produced by the boundary pooler."""
     return decode_output(raw_output, schema or {})
-
-
-def schema_format_args(schema: dict[str, Any] | None) -> tuple[list[str], list[str]]:
-    """Derive ``requested_relations`` and ``classification_tasks`` from a schema.
-
-    Args:
-        schema: GLiNER2 extract schema, or None.
-
-    Returns:
-        ``(requested_relations, classification_tasks)``.
-    """
-    schema = schema or {}
-    classifications = schema.get("classifications") or []
-    tasks = [
-        item["task"]
-        for item in classifications
-        if isinstance(item, dict) and "task" in item
-    ]
-    relations = schema.get("relations") or {}
-    if isinstance(relations, dict):
-        rels = list(relations)
-    elif isinstance(relations, list):
-        rels = [item if isinstance(item, str) else str(item) for item in relations]
-    else:
-        rels = []
-    return rels, tasks
