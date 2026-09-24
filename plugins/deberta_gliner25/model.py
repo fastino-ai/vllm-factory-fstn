@@ -62,6 +62,7 @@ _encoder_mod = _import_deberta_v2_encoder()
 DebertaV2EncoderModel = _encoder_mod.DebertaV2EncoderModel
 _ENCODER_PACKED_MODULES_MAPPING: dict[str, list[str]] = _encoder_mod.PACKED_MODULES_MAPPING
 _ENCODER_EMBEDDING_MODULES: dict[str, str] = _encoder_mod.EMBEDDING_MODULES
+EXTRACTOR_LORA_PREFIX = "_business_pooler.extractor."
 
 
 class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
@@ -71,7 +72,7 @@ class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
     (``classifier`` / ``boundary_head`` / ``record_decoder`` /
     ``relation_scorer`` when present) are converted to ``ReplicatedLinear``
     so a multi-task-head adapter is loadable, and ``hf_to_vllm_mapper``
-    rewrites PEFT's top-level head prefixes onto ``_business_pooler.``.
+    rewrites PEFT's top-level head prefixes onto ``_business_pooler.extractor.``.
     """
 
     is_pooling_model = True
@@ -114,17 +115,28 @@ class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
         self.encoder = DebertaV2EncoderModel(config=encoder_cfg)
         self._encoder_pad_id = int(cfg.encoder_pad_token_id or 0)
 
+        from gliner2.configuration import ExtractorConfig
+        from transformers import AutoTokenizer
+
         from poolers.gliner25 import GLiNER25BoundaryPooler
 
-        self._business_pooler = GLiNER25BoundaryPooler(
-            hidden_size=cfg.encoder_hidden_size,
-            boundary_head=cfg.boundary_head,
-            tokenizer_name=vllm_config.model_config.model,
-            max_model_len=getattr(vllm_config.model_config, "max_model_len", None),
+        tokenizer = AutoTokenizer.from_pretrained(
+            vllm_config.model_config.model, use_fast=True, trust_remote_code=True
         )
-        head_names = present_head_names(self._business_pooler, BOUNDARY_HEAD_NAMES)
-        convert_heads_to_replicated(self._business_pooler, head_names)
-        self.hf_to_vllm_mapper = head_weights_mapper(head_names)
+        extractor_config = ExtractorConfig(
+            model_name=vllm_config.model_config.model,
+            architecture="boundary",
+            token_pooling=cfg.token_pooling,
+            boundary_head=cfg.boundary_head,
+        )
+        self._business_pooler = GLiNER25BoundaryPooler(
+            config=extractor_config,
+            encoder_config=encoder_cfg,
+            tokenizer=tokenizer,
+        )
+        head_names = present_head_names(self._business_pooler.extractor, BOUNDARY_HEAD_NAMES)
+        convert_heads_to_replicated(self._business_pooler.extractor, head_names)
+        self.hf_to_vllm_mapper = head_weights_mapper(head_names, prefix=EXTRACTOR_LORA_PREFIX)
         self.pooler = VllmPoolerAdapter(self._business_pooler, requires_token_ids=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -191,7 +203,8 @@ class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load encoder.* via the DeBERTa encoder; remaining prefixes into the pooler."""
-        pooler_keys = set(self._business_pooler.state_dict().keys())
+        extractor = self._business_pooler.extractor
+        pooler_keys = set(extractor.state_dict().keys())
         backbone_weights = []
         pooler_loaded = {}
 
@@ -230,7 +243,7 @@ class GLiNER25VLLMModel(nn.Module, SupportsLoRA):
                 "GLiNER25 pooler weight-load mismatch — "
                 f"missing={sorted(missing)!r} unexpected={sorted(unexpected)!r}."
             )
-        self._business_pooler.load_state_dict(pooler_loaded, strict=False)
+        extractor.load_state_dict(pooler_loaded, strict=False)
         device = next(self.encoder.parameters()).device
         dtype = self.vllm_config.model_config.dtype
         self._business_pooler.to(device=device, dtype=dtype)

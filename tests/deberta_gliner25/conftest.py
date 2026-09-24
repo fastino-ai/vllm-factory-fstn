@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import importlib.util
+import os
 import sys
 import types
 from collections.abc import Iterator
@@ -17,6 +18,13 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+# Prefer the local GLiNER2 checkout (PR C) over an older installed package.
+_GLINER2_ROOT = Path(
+    os.environ.get("GLINER2_SRC") or Path(__file__).resolve().parents[3] / "GLiNER2"
+)
+if _GLINER2_ROOT.is_dir() and str(_GLINER2_ROOT) not in sys.path:
+    sys.path.insert(0, str(_GLINER2_ROOT))
 
 _PLUGIN_DIR = Path(__file__).resolve().parents[2] / "plugins" / "deberta_gliner25"
 _PROCESSOR_PATH = _PLUGIN_DIR / "processor.py"

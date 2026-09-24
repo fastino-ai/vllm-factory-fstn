@@ -1,8 +1,10 @@
-"""GLiNER 2.5 boundary parity test against AutoExtractor.
+"""GLiNER 2.5 parity: hosted vLLM output against local GLiNER2 batch APIs.
 
 Two-phase design:
-    Phase 1 (--prepare): AutoExtractor reference + vLLM model dir
-    Phase 2 (--test):    vLLM inference + key-set / output comparison
+    Phase 1 (--prepare): local BoundaryExtractor / Classifier / JointIEEngine
+        references plus a vLLM model dir. Install GLiNER2 at PR #165 head
+        (af36b41, version 2.1.0) before running.
+    Phase 2 (--test): vLLM inference compared to those references.
 
 Target: vllm==0.20.0, checkpoint fastino/gliner2.5-multi-v1 (334 head tensors).
 
@@ -16,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import time
 
 MODEL = "fastino/gliner2.5-multi-v1"
 LOCAL_MODEL_DIR = "/tmp/gliner25-multi-vllm"
@@ -56,6 +57,122 @@ SCHEMA = {
 
 THRESHOLD = 0.5
 EXPECTED_HEAD_TENSORS = 334
+
+# Hosted output must match a local GLiNER2 call on these payloads.
+CASES: list[dict] = [
+    {
+        "name": "classic",
+        "runtime": "classic",
+        "text": TEXT,
+        "schema": SCHEMA,
+        "threshold": THRESHOLD,
+        "include_confidence": True,
+        "include_spans": True,
+    },
+    {
+        "name": "classic_thresholds",
+        "runtime": "classic",
+        "text": TEXT,
+        "schema": {
+            "entities": {
+                "person": {"threshold": 0.9},
+                "organization": {"threshold": 0.1},
+            },
+            "classifications": [
+                {
+                    "task": "topic",
+                    "labels": ["technology", "finance", "sports", "healthcare"],
+                    "cls_threshold": 0.8,
+                }
+            ],
+        },
+        "threshold": THRESHOLD,
+        "include_confidence": True,
+        "include_spans": True,
+    },
+    {
+        "name": "records",
+        "runtime": "classic",
+        "text": "Alice met Bob in Paris. Carol met Dave in London.",
+        "schema": {
+            "structures": {
+                "meeting": {
+                    "mode": "natural",
+                    "anchor": "person",
+                    "fields": [
+                        {"name": "person", "dtype": "str"},
+                        {"name": "city", "dtype": "str"},
+                    ],
+                }
+            }
+        },
+        "threshold": THRESHOLD,
+        "include_confidence": True,
+        "include_spans": True,
+    },
+    {
+        "name": "span_attributes",
+        "runtime": "classic",
+        "text": "Alice was delighted, but Bob sounded frustrated.",
+        "schema": {
+            "entities": ["person"],
+            "entity_attributes": {
+                "sentiment": {
+                    "labels": ["positive", "negative", "neutral"],
+                    "applies_to": ["person"],
+                    "qualify_labels": True,
+                }
+            },
+        },
+        "threshold": THRESHOLD,
+        "include_confidence": True,
+        "include_spans": True,
+    },
+    {
+        "name": "constrained_classification",
+        "runtime": "constrained_classification",
+        "text": "Delete the temporary file",
+        "schema": {
+            "tasks": {
+                "intent": {
+                    "labels": ["read", "write", "delete"],
+                    "min_labels": 1,
+                    "max_labels": 1,
+                },
+                "effects": {
+                    "labels": ["read_only", "create", "modify", "delete"],
+                    "min_labels": 1,
+                },
+            },
+            "constraints": [
+                {
+                    "type": "Implies",
+                    "cond": {"type": "LabelRef", "task": "intent", "label": "delete"},
+                    "then": {"type": "LabelRef", "task": "effects", "label": "delete"},
+                }
+            ],
+        },
+        "include_confidence": True,
+        "include_spans": False,
+    },
+    {
+        "name": "joint_ie",
+        "runtime": "joint_ie",
+        "text": "Alice works for Acme. Bob joined Acme last year.",
+        "schema": {
+            "entities": ["person", "organization"],
+            "relations": {
+                "works_for": {
+                    "head": "person",
+                    "tail": "organization",
+                    "unique_head": True,
+                }
+            },
+        },
+        "include_confidence": True,
+        "include_spans": True,
+    },
+]
 # bf16 on the vLLM path against fp32 eager in AutoExtractor.
 CONFIDENCE_TOLERANCE = 0.05
 
@@ -144,29 +261,141 @@ def compare_outputs(
     return problems
 
 
+def _flags(case: dict) -> dict:
+    """Return the request flags a case carries into GLiNER2."""
+    return {
+        "include_confidence": bool(case.get("include_confidence", False)),
+        "include_spans": bool(case.get("include_spans", False)),
+        "threshold": float(case.get("threshold", THRESHOLD)),
+        "max_len": case.get("max_len"),
+    }
+
+
+def local_output(extractor: object, classifier: object, joint: object, case: dict) -> dict:
+    """Run one case through the local GLiNER2 API for its runtime.
+
+    Args:
+        extractor: Encoder-backed ``BoundaryExtractor``.
+        classifier: ``Classifier`` wrapping that extractor.
+        joint: ``JointIEEngine`` wrapping that extractor.
+        case: One entry of ``CASES``.
+
+    Returns:
+        The JSON-ready result dict.
+    """
+    from gliner2.classification import ClassificationConfig, ClassificationSchema
+    from gliner2.inference.schema import Schema
+    from gliner2.joint_ie import JointIEConfig
+    from gliner2.joint_ie.schema import JointSchema
+
+    flags = _flags(case)
+    text = case["text"]
+    schema = case["schema"]
+    runtime = case["runtime"]
+    if runtime == "classic":
+        return extractor.batch_extract(
+            [text],
+            [Schema.from_dict(schema)],
+            threshold=flags["threshold"],
+            include_confidence=flags["include_confidence"],
+            include_spans=flags["include_spans"],
+            max_len=flags["max_len"],
+        )[0]
+    if runtime == "constrained_classification":
+        config = ClassificationConfig(
+            include_confidence=flags["include_confidence"],
+            max_len=flags["max_len"],
+        )
+        result = classifier.batch_classify(
+            [text],
+            [ClassificationSchema.from_dict(schema)],
+            config=config,
+        )[0]
+        return result.to_dict()
+    config = JointIEConfig(
+        include_confidence=flags["include_confidence"],
+        include_spans=flags["include_spans"],
+        max_len=flags["max_len"],
+    )
+    result = joint.batch_extract(
+        [text], [JointSchema.from_dict(schema)], config=config
+    )[0]
+    return result.to_dict()
+
+
+def compare_json(
+    reference: object,
+    candidate: object,
+    *,
+    tolerance: float = CONFIDENCE_TOLERANCE,
+    path: str = "$",
+) -> list[str]:
+    """Diff two JSON-like values, allowing small float drift.
+
+    Args:
+        reference: Local GLiNER2 output.
+        candidate: Hosted vLLM output.
+        tolerance: Largest absolute float difference treated as agreement.
+        path: Location of this value, for mismatch lines.
+
+    Returns:
+        One line per disagreement.
+    """
+    if isinstance(reference, dict) and isinstance(candidate, dict):
+        problems: list[str] = []
+        for key in sorted(set(reference) | set(candidate)):
+            if key not in reference or key not in candidate:
+                problems.append(f"{path}.{key}: missing on one side")
+                continue
+            problems.extend(
+                compare_json(reference[key], candidate[key], tolerance=tolerance, path=f"{path}.{key}")
+            )
+        return problems
+    if isinstance(reference, list) and isinstance(candidate, list):
+        if len(reference) != len(candidate):
+            return [f"{path}: length {len(reference)} vs {len(candidate)}"]
+        problems = []
+        for index, (left, right) in enumerate(zip(reference, candidate, strict=True)):
+            problems.extend(compare_json(left, right, tolerance=tolerance, path=f"{path}[{index}]"))
+        return problems
+    if isinstance(reference, (int, float)) and isinstance(candidate, (int, float)):
+        if isinstance(reference, bool) or isinstance(candidate, bool):
+            if reference is not candidate:
+                return [f"{path}: {reference!r} vs {candidate!r}"]
+            return []
+        if abs(float(reference) - float(candidate)) > tolerance:
+            return [f"{path}: {reference} vs {candidate}"]
+        return []
+    if reference != candidate:
+        return [f"{path}: {reference!r} vs {candidate!r}"]
+    return []
+
+
 def phase_prepare(
     model_name: str = MODEL,
     local_model_dir: str = LOCAL_MODEL_DIR,
     ref_file: str = REF_FILE,
 ) -> None:
     from gliner2 import AutoExtractor
+    from gliner2.classification import Classifier
+    from gliner2.joint_ie import JointIEEngine
 
     from forge.model_prep import prepare_gliner25_model
 
     print("=" * 60)
-    print(f"PHASE 1: AutoExtractor reference ({model_name})")
+    print(f"PHASE 1: local GLiNER2 references ({model_name})")
     print("=" * 60)
 
     extractor = AutoExtractor.from_pretrained(model_name)
     extractor.eval()
-    reference = extractor.extract(
-        TEXT,
-        SCHEMA,
-        threshold=THRESHOLD,
-        include_confidence=True,
-        include_spans=True,
-    )
-    print(json.dumps(reference, indent=2, default=str)[:4000])
+    classifier = Classifier(extractor)
+    joint = JointIEEngine(extractor)
+    references = []
+    for case in CASES:
+        output = local_output(extractor, classifier, joint, case)
+        print(f"--- {case['name']} ---")
+        print(json.dumps(output, indent=2, default=str)[:2000])
+        references.append({"name": case["name"], "case": case, "output": output})
 
     state = extractor.state_dict()
     head_keys = [
@@ -184,9 +413,7 @@ def phase_prepare(
 
     os.makedirs(os.path.dirname(ref_file) or ".", exist_ok=True)
     with open(ref_file, "w") as f:
-        json.dump(
-            {"model": model_name, "text": TEXT, "output": reference}, f, default=str
-        )
+        json.dump({"model": model_name, "cases": references}, f, default=str)
 
     prepared = prepare_gliner25_model(
         model_name, output_dir=local_model_dir, force=True
@@ -205,13 +432,10 @@ def phase_test(
     from vllm.inputs import TokensPrompt
     from vllm.pooling_params import PoolingParams
 
-    from gliner2.inference.runtime import format_results as gliner2_format_results
-
-    from plugins.deberta_gliner2.processor import normalize_gliner2_schema
     from plugins.deberta_gliner25.processor import (
         decode_boundary_output,
         preprocess_boundary,
-        schema_format_args,
+        prompt_schema,
     )
 
     print("=" * 60)
@@ -220,20 +444,9 @@ def phase_test(
 
     with open(ref_file) as f:
         ref = json.load(f)
+    saved = {item["name"]: item for item in ref["cases"]}
 
     tokenizer = AutoTokenizer.from_pretrained(local_model_dir)
-    schema = normalize_gliner2_schema(SCHEMA)
-    prep = preprocess_boundary(
-        tokenizer,
-        TEXT,
-        schema,
-        threshold=THRESHOLD,
-        include_confidence=True,
-        include_spans=True,
-    )
-    prompt_ids = prep["input_ids"]
-    extra = prep["extra_kwargs"]
-
     llm = LLM(
         model=local_model_dir,
         trust_remote_code=True,
@@ -243,30 +456,30 @@ def phase_test(
         enable_chunked_prefill=False,
         gpu_memory_utilization=0.78,
     )
-    prompt = TokensPrompt(prompt_token_ids=prompt_ids)
-    pooling_params = PoolingParams(task="plugin", extra_kwargs=extra)
-    _ = llm.encode([prompt], pooling_params=pooling_params, pooling_task="plugin")
-
-    n = 5
-    t0 = time.perf_counter()
-    for _ in range(n):
-        outputs = llm.encode(
-            [prompt], pooling_params=pooling_params, pooling_task="plugin"
+    problems: list[str] = []
+    for case in CASES:
+        flags = _flags(case)
+        prompt = prompt_schema(case["runtime"], case["schema"])
+        prep = preprocess_boundary(
+            tokenizer,
+            case["text"],
+            case["schema"],
+            prompt=prompt,
+            runtime=case["runtime"],
+            threshold=flags["threshold"],
+            include_confidence=flags["include_confidence"],
+            include_spans=flags["include_spans"],
         )
-    latency = (time.perf_counter() - t0) / n * 1000
-    raw = outputs[0].outputs.data
-    decoded = decode_boundary_output(raw, schema)
-    requested_relations, classification_tasks = schema_format_args(schema)
-    formatted = gliner2_format_results(
-        decoded,
-        include_confidence=True,
-        requested_relations=requested_relations,
-        classification_tasks=classification_tasks,
-    )
-    print(json.dumps(formatted, indent=2, default=str)[:4000])
-    print(f"Latency: {latency:.1f}ms")
-
-    problems = compare_outputs(ref.get("output") or {}, formatted)
+        pooling_params = PoolingParams(task="plugin", extra_kwargs=prep["extra_kwargs"])
+        tokens = TokensPrompt(prompt_token_ids=prep["input_ids"])
+        outputs = llm.encode([tokens], pooling_params=pooling_params, pooling_task="plugin")
+        hosted = decode_boundary_output(outputs[0].outputs.data, case["schema"])
+        reference = saved[case["name"]]["output"]
+        case_problems = compare_json(reference, hosted)
+        for problem in case_problems:
+            problems.append(f"{case['name']}: {problem}")
+        print(f"--- {case['name']} ---")
+        print(json.dumps(hosted, indent=2, default=str)[:2000])
     for problem in problems:
         print(f"  MISMATCH {problem}")
     print("PASS" if not problems else f"FAIL ({len(problems)} mismatch(es))")

@@ -6,13 +6,22 @@ payloads hands one caller another's extraction.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
+from pathlib import Path
 from types import ModuleType
 
 import torch
 
-from vllm_factory.pooling.protocol import PoolerContext
+_PROTOCOL = (
+    Path(__file__).resolve().parents[2] / "vllm_factory" / "pooling" / "protocol.py"
+)
+_protocol_spec = importlib.util.spec_from_file_location("gliner25_pooler_protocol", _PROTOCOL)
+_protocol = importlib.util.module_from_spec(_protocol_spec)
+sys.modules["gliner25_pooler_protocol"] = _protocol
+_protocol_spec.loader.exec_module(_protocol)
+PoolerContext = _protocol.PoolerContext
 
 
 def _decode(payload: torch.Tensor) -> dict:
@@ -69,10 +78,11 @@ def test_missing_extras_do_not_shift_the_other_results(
     )
     monkeypatch.setattr(
         pooler_mod.GLiNER25BoundaryPooler,
-        "_process_one",
-        lambda self, token_embs, extra: pooler_mod._pack_json(extra, token_embs.device),
+        "_decode_group",
+        lambda self, sequences, extras: [
+            pooler_mod._pack_json(extra, sequences[0].device) for extra in extras
+        ],
     )
-    monkeypatch.setattr(pooler_mod, "_can_batch_compact", lambda extras: False)
     pooler = object.__new__(pooler_mod.GLiNER25BoundaryPooler)
     # vLLM scheduled three sequences but only two carry extras.
     ctx = _Ctx([2, 3, 4], [{"first": True}, {}])
@@ -80,3 +90,51 @@ def test_missing_extras_do_not_shift_the_other_results(
     outputs = pooler_mod.GLiNER25BoundaryPooler.forward(pooler, torch.zeros(9, 4), ctx)
 
     assert [_decode(payload) for payload in outputs] == [{"first": True}, {}, {}]
+
+
+def test_same_key_shares_one_call_and_a_different_runtime_does_not(
+    pooler_mod: ModuleType, monkeypatch
+):
+    """Grouping is (runtime, threshold, flags, max_len), and order is preserved."""
+    monkeypatch.setattr(
+        pooler_mod,
+        "split_hidden_states",
+        lambda hidden_states, seq_lengths: [torch.zeros(n, 4) for n in seq_lengths],
+    )
+    calls: list[list[str]] = []
+
+    def _decode(self, sequences, extras):
+        calls.append([extra["runtime"] for extra in extras])
+        return [pooler_mod._pack_json({"i": index}, sequences[0].device) for index, _ in enumerate(extras)]
+
+    monkeypatch.setattr(pooler_mod.GLiNER25BoundaryPooler, "_decode_group", _decode)
+    pooler = object.__new__(pooler_mod.GLiNER25BoundaryPooler)
+    shared = {"_compact": True, "runtime": "classic", "threshold": 0.5}
+    other = {**shared, "runtime": "joint_ie"}
+    ctx = _Ctx([2, 2, 2], [shared, other, shared])
+
+    outputs = pooler_mod.GLiNER25BoundaryPooler.forward(pooler, torch.zeros(6, 4), ctx)
+
+    assert calls == [["classic", "classic"], ["joint_ie"]]
+    assert [_decode_payload(payload) for payload in outputs] == [{"i": 0}, {"i": 0}, {"i": 1}]
+
+
+def _decode_payload(payload: torch.Tensor) -> dict:
+    return _decode(payload)
+
+
+def test_group_key_includes_runtime_threshold_and_max_len(pooler_mod: ModuleType):
+    base = {
+        "runtime": "classic",
+        "threshold": 0.5,
+        "include_confidence": False,
+        "include_spans": True,
+        "max_len": 32,
+    }
+    assert pooler_mod._group_key(base) == ("classic", 0.5, False, True, 32)
+    changed = {**base, "runtime": "constrained_classification", "max_len": None}
+    # A missing cap and an explicit None are the same group.
+    assert pooler_mod._group_key(changed) == pooler_mod._group_key(
+        {key: value for key, value in changed.items() if key != "max_len"}
+    )
+    assert pooler_mod._group_key(base) != pooler_mod._group_key(changed)
